@@ -1,4 +1,6 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -11,10 +13,8 @@ internal static class Program {
     // ======================
     // User-tunable defaults
     // ======================
-    private const string StyleTag = "mumistyle";
-
-    // txt欠損が最悪なので、最終フォールバックは必ず書ける「安全な最低限」
-    private const string MinimalFallback = "mumistyle, manga_style, lineart, 1girl, solo";
+    private const string DefaultAutoPrefixTags = "";
+    private const string DefaultMinimalSubjectTags = "";
 
     // 画像サイズ制限（OpenAI送信対策）
     private const int MaxSideResize = 2048;
@@ -26,12 +26,7 @@ internal static class Program {
     // ======================
 
     // 最優先タグ（LoRAで“寄り”が強くなるので先頭固定）
-    private static readonly string[] HardPrefixTags =
-    [
-        StyleTag,
-        "manga_style",
-        "lineart"
-    ];
+    private static string[] HardPrefixTags = [];
 
     // “重要な特徴量”っぽいタグ（これらは前方へ寄せる）
     // Danbooru tagger系を想定して、underscore前提
@@ -84,65 +79,49 @@ internal static class Program {
     // Entry
     // ======================
     public static async Task<int> Main(string[] args) {
-        if (args.Length == 0 || args.Contains("--help") || args.Contains("-h")) {
+        if (args.Contains("--help") || args.Contains("-h")) {
             PrintHelp();
             return 0;
         }
 
-        var dir = args[0];
-        if (!Directory.Exists(dir)) {
-            Console.Error.WriteLine($"Directory not found: {dir}");
+        var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith('-', StringComparison.Ordinal));
+        var options = launchWizard
+            ? RunWizard()
+            : ParseOptions(args);
+
+        if (options is null)
             return 2;
+
+        HardPrefixTags = SplitTags(options.AutoPrefixTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var minimalFallback = string.Join(", ", HardPrefixTags.Concat(SplitTags(options.MinimalSubjectTags)).Distinct(StringComparer.OrdinalIgnoreCase));
+
+        if (!options.Quiet) {
+            Console.WriteLine($"Dir={options.Dir}");
+            Console.WriteLine($"Recursive={options.Recursive} Overwrite={options.Overwrite} KeepNeedtag={options.KeepNeedtag}");
+            Console.WriteLine($"Concurrency={options.Concurrency} TargetBytes={options.TargetBytes} MinTags={options.MinTags} MaxTags={options.MaxTags}");
+            Console.WriteLine($"JoyUrl={options.JoyUrl} JoyRetries={options.JoyRetries} JoyThreshold={options.JoyThresholdStart:0.00} Step={options.JoyThresholdStep:0.00}");
+            Console.WriteLine($"OpenAI={(string.IsNullOrWhiteSpace(options.ApiKey) ? "OFF" : "ON")} Model={options.OpenAiModel} Retries={options.OpenAiRetries}");
+            Console.WriteLine("Policy: Always write .txt even if tags are few.");
         }
 
-        var recursive = args.Contains("--recursive");
-        var overwrite = args.Contains("--overwrite");
-        var quiet = args.Contains("--quiet");
-        var keepNeedtag = args.Contains("--keep-needtag");
+        Process? autoStartedJoyTagProcess = null;
+        if (options.AutoStartJoyTag) {
+            var start = await StartOrReuseJoyTagServerAsync(options);
+            if (start.ExitCode != 0)
+                return start.ExitCode;
 
-        var concurrency = Clamp(ParseInt(GetArg(args, "--concurrency"), 8), 1, 64);
-        var targetBytes = Clamp(ParseInt(GetArg(args, "--target-bytes"), 3_000_000), 400_000, 20_000_000);
-
-        // 「少ないときに頑張る」基準。少なくても最終的には書く（欠損ゼロ）
-        var minTags = Clamp(ParseInt(GetArg(args, "--min-tags"), 30), 5, 200);
-
-        // 最終的に保存するタグ数上限（ノイズカット用）
-        var maxTags = Clamp(ParseInt(GetArg(args, "--max-tags"), 80), 20, 300);
-
-        // JoyTag server
-        var joyUrl = GetArg(args, "--joy-url") ?? "http://127.0.0.1:7865";
-        var joyRetries = Clamp(ParseInt(GetArg(args, "--joy-retries"), 3), 0, 10);
-        var joyThresholdStart = ClampDouble(ParseDouble(GetArg(args, "--joy-threshold"), 0.40), 0.10, 0.90);
-        var joyThresholdStep = ClampDouble(ParseDouble(GetArg(args, "--joy-threshold-step"), 0.05), 0.01, 0.20);
-
-        // OpenAI optional
-        var openAiModel = GetArg(args, "--model") ?? "gpt-4.1-mini";
-        var openAiRetries = Clamp(ParseInt(GetArg(args, "--openai-retries"), 1), 0, 6);
-        var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY"); // 無ければ自動でスキップ
-
-        // 既存txtスキップ。ただし“明らかに拒否/壊れ”は再生成して上書き
-        var reprocessBadExisting = !args.Contains("--no-reprocess-bad-existing");
-
-        var noOpenAi = args.Contains("--no-openai");
-
-        if (noOpenAi) apiKey = null;
-
-        if (!quiet) {
-            Console.WriteLine($"Dir={dir}");
-            Console.WriteLine($"Recursive={recursive} Overwrite={overwrite} KeepNeedtag={keepNeedtag}");
-            Console.WriteLine($"Concurrency={concurrency} TargetBytes={targetBytes} MinTags={minTags} MaxTags={maxTags}");
-            Console.WriteLine($"JoyUrl={joyUrl} JoyRetries={joyRetries} JoyThreshold={joyThresholdStart:0.00} Step={joyThresholdStep:0.00}");
-            Console.WriteLine($"OpenAI={(string.IsNullOrWhiteSpace(apiKey) ? "OFF" : "ON")} Model={openAiModel} Retries={openAiRetries}");
-            Console.WriteLine("Policy: Always write .txt even if tags are few.");
+            autoStartedJoyTagProcess = start.AutoStartedProcess;
+            if (autoStartedJoyTagProcess is not null)
+                RegisterJoyTagShutdownHandlers(autoStartedJoyTagProcess);
         }
 
         using var httpJoy = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
         using var httpOpenAI = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
-        if (!string.IsNullOrWhiteSpace(apiKey))
-            httpOpenAI.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        if (!string.IsNullOrWhiteSpace(options.ApiKey))
+            httpOpenAI.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.ApiKey);
 
-        var opt = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var images = Directory.EnumerateFiles(dir, "*.*", opt)
+        var opt = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var images = Directory.EnumerateFiles(options.Dir, "*.*", opt)
             .Where(p => ImageExts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -150,7 +129,7 @@ internal static class Program {
         int ok = 0, skipped = 0, repaired = 0, low = 0, failed = 0;
         var errors = new ConcurrentBag<string>();
 
-        var po = new ParallelOptions { MaxDegreeOfParallelism = concurrency };
+        var po = new ParallelOptions { MaxDegreeOfParallelism = options.Concurrency };
 
         await Parallel.ForEachAsync(images, po, async (imagePath, ct) => {
             var txtPath = Path.ChangeExtension(imagePath, ".txt");
@@ -158,14 +137,14 @@ internal static class Program {
 
             try {
                 // 既存txtの扱い
-                if (!overwrite && File.Exists(txtPath)) {
-                    if (!reprocessBadExisting) {
+                if (!options.Overwrite && File.Exists(txtPath)) {
+                    if (!options.ReprocessBadExisting) {
                         Interlocked.Increment(ref skipped);
                         return;
                     }
 
                     var existing = await File.ReadAllTextAsync(txtPath, ct);
-                    var existingNorm = NormalizeAndShape(existing, maxTags);
+                    var existingNorm = NormalizeAndShape(existing, options.MaxTags);
 
                     if (!LooksBad(existingNorm)) {
                         Interlocked.Increment(ref skipped);
@@ -178,45 +157,45 @@ internal static class Program {
                 }
 
                 // 画像ロード＋必要なら3MBへ圧縮（OpenAI/HTTP送信用）
-                var (mime, bytes) = await LoadAndMaybeCompressAsync(imagePath, targetBytes, ct);
+                var (mime, bytes) = await LoadAndMaybeCompressAsync(imagePath, options.TargetBytes, ct);
 
                 // 1) JoyTag server（基本これが主役）
                 string tagsJoy = await JoyTagAutoRetryAsync(
-                    httpJoy, joyUrl, bytes,
-                    joyThresholdStart, joyThresholdStep,
-                    joyRetries, minTags, ct);
+                    httpJoy, options.JoyUrl, bytes,
+                    options.JoyThresholdStart, options.JoyThresholdStep,
+                    options.JoyRetries, options.MinTags, ct);
 
-                tagsJoy = NormalizeAndShape(tagsJoy, maxTags);
+                tagsJoy = NormalizeAndShape(tagsJoy, options.MaxTags);
 
                 // 2) OpenAI（任意の補強。JoyTagが弱い/少ないときだけ）
                 string tagsOpen = "";
-                if (!string.IsNullOrWhiteSpace(apiKey)) {
-                    if (CountTags(tagsJoy) < minTags || LooksBad(tagsJoy)) {
-                        tagsOpen = await OpenAiRetryAsync(httpOpenAI, openAiModel, mime, bytes, openAiRetries, ct);
-                        tagsOpen = NormalizeAndShape(tagsOpen, maxTags);
+                if (!string.IsNullOrWhiteSpace(options.ApiKey)) {
+                    if (CountTags(tagsJoy) < options.MinTags || LooksBad(tagsJoy)) {
+                        tagsOpen = await OpenAiRetryAsync(httpOpenAI, options.OpenAiModel, mime, bytes, options.OpenAiRetries, ct);
+                        tagsOpen = NormalizeAndShape(tagsOpen, options.MaxTags);
                     }
                 }
 
                 // 3) マージ（“キャラ特徴”を落とさない方針）
                 // - JoyTagを土台
                 // - OpenAIが有益なら補完（ただしノイズもあるので強めに整形）
-                string merged = MergePreferJoyThenOpen(tagsJoy, tagsOpen, maxTags);
+                string merged = MergePreferJoyThenOpen(tagsJoy, tagsOpen, options.MaxTags);
 
                 // 4) 最終：style prefix + hard prefix tags
                 merged = EnsureHardPrefixes(merged);
 
                 // 5) txt欠損ゼロ：空/極端に短いなら最低限を書く
                 if (string.IsNullOrWhiteSpace(merged) || CountTags(merged) < 3)
-                    merged = EnsureHardPrefixes(MinimalFallback);
+                    merged = EnsureHardPrefixes(minimalFallback);
 
                 // 6) 書き込み
                 await File.WriteAllTextAsync(txtPath, merged + Environment.NewLine, new UTF8Encoding(false), ct);
 
                 // 7) needtag（低品質フラグ）
-                bool isLow = CountTags(merged) < minTags || LooksBad(merged);
+                bool isLow = CountTags(merged) < options.MinTags || LooksBad(merged);
                 if (isLow) {
                     Interlocked.Increment(ref low);
-                    if (keepNeedtag)
+                    if (options.KeepNeedtag)
                         await File.WriteAllTextAsync(needPath, "low tags; check later" + Environment.NewLine, new UTF8Encoding(false), ct);
                     else
                         TryDelete(needPath);
@@ -226,7 +205,7 @@ internal static class Program {
 
                 Interlocked.Increment(ref ok);
 
-                if (!quiet)
+                if (!options.Quiet)
                     Console.WriteLine($"[ok] {Path.GetFileName(imagePath)} tags={CountTags(merged)}");
             } catch (Exception ex) {
                 Interlocked.Increment(ref failed);
@@ -235,9 +214,9 @@ internal static class Program {
                 // 最悪でもtxtだけは作る（要望）
                 try {
                     if (!File.Exists(txtPath))
-                        await File.WriteAllTextAsync(txtPath, EnsureHardPrefixes(MinimalFallback) + Environment.NewLine, new UTF8Encoding(false), ct);
+                        await File.WriteAllTextAsync(txtPath, EnsureHardPrefixes(minimalFallback) + Environment.NewLine, new UTF8Encoding(false), ct);
 
-                    if (keepNeedtag)
+                    if (options.KeepNeedtag)
                         await File.WriteAllTextAsync(needPath, "error; check later" + Environment.NewLine, new UTF8Encoding(false), ct);
                 } catch { /* ignore */ }
             }
@@ -251,6 +230,275 @@ internal static class Program {
         }
 
         return failed == 0 ? 0 : 1;
+    }
+
+    private static AppOptions? ParseOptions(string[] args) {
+        var dir = args[0];
+        if (!Directory.Exists(dir)) {
+            Console.Error.WriteLine($"Directory not found: {dir}");
+            return null;
+        }
+
+        var options = new AppOptions {
+            Dir = dir,
+            Recursive = args.Contains("--recursive"),
+            Overwrite = args.Contains("--overwrite"),
+            Quiet = args.Contains("--quiet"),
+            KeepNeedtag = args.Contains("--keep-needtag"),
+            Concurrency = Clamp(ParseInt(GetArg(args, "--concurrency"), 8), 1, 64),
+            TargetBytes = Clamp(ParseInt(GetArg(args, "--target-bytes"), 3_000_000), 400_000, 20_000_000),
+            MinTags = Clamp(ParseInt(GetArg(args, "--min-tags"), 30), 5, 200),
+            MaxTags = Clamp(ParseInt(GetArg(args, "--max-tags"), 80), 20, 300),
+            JoyUrl = GetArg(args, "--joy-url") ?? "http://127.0.0.1:7865",
+            JoyRetries = Clamp(ParseInt(GetArg(args, "--joy-retries"), 3), 0, 10),
+            JoyThresholdStart = ClampDouble(ParseDouble(GetArg(args, "--joy-threshold"), 0.40), 0.10, 0.90),
+            JoyThresholdStep = ClampDouble(ParseDouble(GetArg(args, "--joy-threshold-step"), 0.05), 0.01, 0.20),
+            OpenAiModel = GetArg(args, "--model") ?? "gpt-4.1-mini",
+            OpenAiRetries = Clamp(ParseInt(GetArg(args, "--openai-retries"), 1), 0, 6),
+            ReprocessBadExisting = !args.Contains("--no-reprocess-bad-existing"),
+            AutoPrefixTags = GetArg(args, "--auto-prefix-tags") ?? "",
+            MinimalSubjectTags = GetArg(args, "--minimal-subject-tags") ?? "",
+            AutoStartJoyTag = args.Contains("--auto-start-joytag"),
+            JoyTagPythonExe = GetArg(args, "--joytag-python"),
+            JoyTagWorkingDir = GetArg(args, "--joytag-dir")
+        };
+
+        var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (args.Contains("--no-openai")) apiKey = null;
+        options.ApiKey = apiKey;
+
+        if (!HasUserDefinedMinimumTags(options))
+            return null;
+
+        return options;
+    }
+
+    private static AppOptions? RunWizard() {
+        var saved = LoadWizardConfig();
+        Console.WriteLine("=== ImageCaptioner Wizard ===");
+        Console.WriteLine("Enterキーだけで前回値を再利用します。\n");
+
+        var dir = PromptString("画像フォルダ", saved.LastDir);
+        if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) {
+            Console.Error.WriteLine("有効なフォルダを指定してください。");
+            return null;
+        }
+
+        var joyUrl = PromptString("JoyTag URL", saved.JoyUrl);
+        var autoPrefixTags = PromptString("常に先頭へ付けるタグ(カンマ区切り)", saved.AutoPrefixTags);
+        var minimalSubjectTags = PromptString("最低限タグ(失敗時フォールバック)", saved.MinimalSubjectTags);
+
+        var options = new AppOptions {
+            Dir = dir,
+            Recursive = PromptBoolByEmpty("再帰処理する？(Enter=Yes, 文字入力でNo)", saved.Recursive),
+            Overwrite = PromptBoolByEmpty("既存txtも上書きする？(Enter=Yes, 文字入力でNo)", saved.Overwrite),
+            Quiet = PromptBoolByEmpty("ログ少なめにする？(Enter=Yes, 文字入力でNo)", saved.Quiet),
+            KeepNeedtag = PromptBoolByEmpty(".needtagを残す？(Enter=Yes, 文字入力でNo)", saved.KeepNeedtag),
+            ReprocessBadExisting = true,
+            Concurrency = PromptInt("並列数", saved.Concurrency, 1, 64),
+            MinTags = PromptInt("最小タグ数", saved.MinTags, 5, 200),
+            MaxTags = PromptInt("最大タグ数", saved.MaxTags, 20, 300),
+            TargetBytes = PromptInt("送信用ターゲットサイズ(bytes)", saved.TargetBytes, 400_000, 20_000_000),
+            JoyUrl = string.IsNullOrWhiteSpace(joyUrl) ? "http://127.0.0.1:7865" : joyUrl,
+            JoyRetries = PromptInt("JoyTagリトライ回数", saved.JoyRetries, 0, 10),
+            JoyThresholdStart = PromptDouble("JoyTag threshold開始値", saved.JoyThresholdStart, 0.10, 0.90),
+            JoyThresholdStep = PromptDouble("JoyTag threshold減少幅", saved.JoyThresholdStep, 0.01, 0.20),
+            OpenAiModel = saved.OpenAiModel,
+            OpenAiRetries = saved.OpenAiRetries,
+            ApiKey = null,
+            AutoPrefixTags = autoPrefixTags.Trim(),
+            MinimalSubjectTags = minimalSubjectTags.Trim(),
+            AutoStartJoyTag = PromptBoolByEmpty("JoyTagサーバーを自動起動する？(Enter=Yes, 文字入力でNo)", saved.AutoStartJoyTag),
+            JoyTagWorkingDir = PromptString("JoyTagフォルダ", saved.JoyTagWorkingDir),
+            JoyTagPythonExe = PromptString("JoyTag python.exe", saved.JoyTagPythonExe)
+        };
+
+        var openAiOff = PromptBoolByEmpty("OpenAIを無効化する？(Enter=Yes, 文字入力でNo)", true);
+        if (!openAiOff) {
+            options.ApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+            options.OpenAiModel = PromptString("OpenAIモデル", saved.OpenAiModel);
+            options.OpenAiRetries = PromptInt("OpenAIリトライ", saved.OpenAiRetries, 0, 6);
+        }
+
+        if (!HasUserDefinedMinimumTags(options)) {
+            Console.Error.WriteLine("最低限タグはユーザー入力で指定してください（auto-prefix-tags または minimal-subject-tags）。");
+            return null;
+        }
+
+        SaveWizardConfig(new WizardConfig {
+            LastDir = options.Dir,
+            JoyUrl = options.JoyUrl,
+            Concurrency = options.Concurrency,
+            MinTags = options.MinTags,
+            MaxTags = options.MaxTags,
+            TargetBytes = options.TargetBytes,
+            Recursive = options.Recursive,
+            Overwrite = options.Overwrite,
+            Quiet = options.Quiet,
+            KeepNeedtag = options.KeepNeedtag,
+            AutoPrefixTags = options.AutoPrefixTags,
+            MinimalSubjectTags = options.MinimalSubjectTags,
+            AutoStartJoyTag = options.AutoStartJoyTag,
+            JoyTagWorkingDir = options.JoyTagWorkingDir,
+            JoyTagPythonExe = options.JoyTagPythonExe,
+            JoyRetries = options.JoyRetries,
+            JoyThresholdStart = options.JoyThresholdStart,
+            JoyThresholdStep = options.JoyThresholdStep,
+            OpenAiModel = options.OpenAiModel,
+            OpenAiRetries = options.OpenAiRetries
+        });
+
+        return options;
+    }
+
+    private static bool HasUserDefinedMinimumTags(AppOptions options) {
+        var hasAny = SplitTags(options.AutoPrefixTags).Any() || SplitTags(options.MinimalSubjectTags).Any();
+        if (hasAny) return true;
+
+        Console.Error.WriteLine("最低限タグが未設定です。--auto-prefix-tags または --minimal-subject-tags で指定してください。");
+        return false;
+    }
+
+    private static async Task<(int ExitCode, Process? AutoStartedProcess)> StartOrReuseJoyTagServerAsync(AppOptions options) {
+        if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+            Console.WriteLine("JoyTag is already alive. Reusing existing server.");
+            return (0, null);
+        }
+
+        if (!TryGetPortOwnerPids(options.JoyUrl, out var pids)) {
+            Console.Error.WriteLine("[error] Failed to inspect port owner process on JoyTag port.");
+            return (2, null);
+        }
+
+        if (pids.Count > 0) {
+            foreach (var pid in pids) {
+                if (!TryKillProcessTree(pid)) {
+                    Console.Error.WriteLine($"[error] Failed to kill PID {pid} on JoyTag port. Run as administrator.");
+                    return (2, null);
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(options.JoyTagWorkingDir) || string.IsNullOrWhiteSpace(options.JoyTagPythonExe)) {
+            Console.Error.WriteLine("[error] JoyTag auto-start requires joytag-dir and joytag-python.");
+            return (2, null);
+        }
+
+        var psi = new ProcessStartInfo {
+            FileName = options.JoyTagPythonExe,
+            WorkingDirectory = options.JoyTagWorkingDir,
+            Arguments = $"-m uvicorn joytag_server:app --host 127.0.0.1 --port {GetPort(options.JoyUrl)} --workers 1",
+            UseShellExecute = false,
+            CreateNoWindow = false
+        };
+
+        var p = Process.Start(psi);
+        if (p is null) {
+            Console.Error.WriteLine("[error] Failed to start JoyTag process.");
+            return (2, null);
+        }
+
+        for (int i = 0; i < 30; i++) {
+            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+                Console.WriteLine("JoyTag started and is ready.");
+                return (0, p);
+            }
+            await Task.Delay(1000);
+        }
+
+        Console.Error.WriteLine("[error] JoyTag did not become ready within 30 seconds.");
+        try { if (!p.HasExited) p.Kill(entireProcessTree: true); } catch { }
+        return (3, null);
+    }
+
+    private static void RegisterJoyTagShutdownHandlers(Process process) {
+        void KillIfRunning() {
+            try {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            } catch { }
+        }
+
+        Console.CancelKeyPress += (_, e) => {
+            e.Cancel = false;
+            KillIfRunning();
+        };
+        AppDomain.CurrentDomain.ProcessExit += (_, __) => KillIfRunning();
+    }
+
+    private static async Task<bool> IsJoyTagAliveAsync(string joyUrl, CancellationToken ct) {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+
+        async Task<bool> CheckAsync(string suffix, string[] keywords) {
+            var url = $"{joyUrl.TrimEnd('/')}{suffix}";
+            try {
+                using var resp = await http.GetAsync(url, ct);
+                if (!resp.IsSuccessStatusCode) return false;
+                var text = (await resp.Content.ReadAsStringAsync(ct)).ToLowerInvariant();
+                return keywords.Any(k => text.Contains(k));
+            } catch {
+                return false;
+            }
+        }
+
+        if (await CheckAsync("/openapi.json", ["openapi", "paths", "swagger"]))
+            return true;
+
+        if (await CheckAsync("/docs", ["swagger", "openapi", "fastapi"]))
+            return true;
+
+        return false;
+    }
+
+    private static bool TryGetPortOwnerPids(string joyUrl, out List<int> pids) {
+        pids = new List<int>();
+        try {
+            if (!OperatingSystem.IsWindows()) return true;
+
+            var port = GetPort(joyUrl);
+            var psi = new ProcessStartInfo {
+                FileName = "powershell",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                Arguments = "-NoProfile -Command \"$port=" + port + "; netstat -ano | findstr :$port | % { ($_ -split '\\s+')[-1] } | ? { $_ -match '^\\d+$' } | sort -Unique\""
+            };
+
+            using var p = Process.Start(psi);
+            if (p is null) return false;
+            var output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(3000);
+
+            foreach (var line in output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)) {
+                if (int.TryParse(line.Trim(), out var pid))
+                    pids.Add(pid);
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    private static bool TryKillProcessTree(int pid) {
+        try {
+            if (!OperatingSystem.IsWindows()) return true;
+
+            var psi = new ProcessStartInfo {
+                FileName = "taskkill",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                Arguments = $"/PID {pid} /F /T"
+            };
+            using var p = Process.Start(psi);
+            if (p is null) return false;
+            p.WaitForExit(5000);
+            return p.ExitCode == 0;
+        } catch {
+            return false;
+        }
     }
 
     // ======================
@@ -659,7 +907,7 @@ internal static class Program {
     }
 
     private static int ParseInt(string? s, int fallback) => int.TryParse(s, out var v) ? v : fallback;
-    private static double ParseDouble(string? s, double fallback) => double.TryParse(s, out var v) ? v : fallback;
+    private static double ParseDouble(string? s, double fallback) => double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
     private static int Clamp(int v, int lo, int hi) => Math.Max(lo, Math.Min(hi, v));
     private static double ClampDouble(double v, double lo, double hi) => Math.Max(lo, Math.Min(hi, v));
@@ -668,11 +916,126 @@ internal static class Program {
         try { if (File.Exists(path)) File.Delete(path); } catch { }
     }
 
+
+    private static string PromptString(string label, string fallback) {
+        Console.Write($"{label} [{fallback}]: ");
+        var input = Console.ReadLine();
+        return string.IsNullOrWhiteSpace(input) ? fallback : input.Trim();
+    }
+
+    private static bool PromptBoolByEmpty(string label, bool fallback) {
+        while (true) {
+            Console.Write($"{label} (Enter=前回値, 現在値: {fallback}) [y/n]: ");
+            var input = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(input))
+                return fallback;
+
+            var t = input.Trim().ToLowerInvariant();
+            if (t is "1" or "true" or "t" or "yes" or "y") return true;
+            if (t is "0" or "false" or "f" or "no" or "n") return false;
+
+            Console.WriteLine("入力は y/n, yes/no, true/false, 1/0 のいずれかで指定してください。");
+        }
+    }
+
+    private static int PromptInt(string label, int fallback, int min, int max) {
+        var text = PromptString(label, fallback.ToString(CultureInfo.InvariantCulture));
+        return Clamp(ParseInt(text, fallback), min, max);
+    }
+
+    private static double PromptDouble(string label, double fallback, double min, double max) {
+        var text = PromptString(label, fallback.ToString("0.00", CultureInfo.InvariantCulture));
+        return ClampDouble(ParseDouble(text, fallback), min, max);
+    }
+
+    private static string GetWizardConfigPath() {
+        var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var dir = Path.Combine(baseDir, "ImageCaptioner");
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, "wizard-config.json");
+    }
+
+    private static WizardConfig LoadWizardConfig() {
+        try {
+            var path = GetWizardConfigPath();
+            if (!File.Exists(path)) return new WizardConfig();
+            var json = File.ReadAllText(path);
+            var cfg = JsonSerializer.Deserialize<WizardConfig>(json);
+            return cfg ?? new WizardConfig();
+        } catch {
+            return new WizardConfig();
+        }
+    }
+
+    private static void SaveWizardConfig(WizardConfig config) {
+        try {
+            var path = GetWizardConfigPath();
+            var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(path, json, new UTF8Encoding(false));
+        } catch {
+        }
+    }
+
+    private static int GetPort(string joyUrl) {
+        if (Uri.TryCreate(joyUrl, UriKind.Absolute, out var uri) && uri.Port > 0)
+            return uri.Port;
+        return 7865;
+    }
+
+    private sealed class AppOptions {
+        public string Dir { get; set; } = "";
+        public bool Recursive { get; set; } = true;
+        public bool Overwrite { get; set; }
+        public bool Quiet { get; set; } = true;
+        public bool KeepNeedtag { get; set; } = true;
+        public int Concurrency { get; set; } = 12;
+        public int TargetBytes { get; set; } = 3_000_000;
+        public int MinTags { get; set; } = 30;
+        public int MaxTags { get; set; } = 80;
+        public string JoyUrl { get; set; } = "http://127.0.0.1:7865";
+        public int JoyRetries { get; set; } = 3;
+        public double JoyThresholdStart { get; set; } = 0.4;
+        public double JoyThresholdStep { get; set; } = 0.05;
+        public string OpenAiModel { get; set; } = "gpt-4.1-mini";
+        public int OpenAiRetries { get; set; } = 1;
+        public string? ApiKey { get; set; }
+        public bool ReprocessBadExisting { get; set; } = true;
+        public string AutoPrefixTags { get; set; } = "";
+        public string MinimalSubjectTags { get; set; } = "";
+        public bool AutoStartJoyTag { get; set; }
+        public string? JoyTagPythonExe { get; set; }
+        public string? JoyTagWorkingDir { get; set; }
+    }
+
+    private sealed class WizardConfig {
+        public string LastDir { get; set; } = "";
+        public string JoyUrl { get; set; } = "http://127.0.0.1:7865";
+        public int Concurrency { get; set; } = 12;
+        public int MinTags { get; set; } = 30;
+        public int MaxTags { get; set; } = 80;
+        public int TargetBytes { get; set; } = 3_000_000;
+        public bool Recursive { get; set; } = true;
+        public bool Overwrite { get; set; }
+        public bool Quiet { get; set; } = true;
+        public bool KeepNeedtag { get; set; } = true;
+        public string AutoPrefixTags { get; set; } = "";
+        public string MinimalSubjectTags { get; set; } = "";
+        public bool AutoStartJoyTag { get; set; } = true;
+        public string JoyTagWorkingDir { get; set; } = @"D:\tools\joytag";
+        public string JoyTagPythonExe { get; set; } = @"D:\tools\joytag\venv\Scripts\python.exe";
+        public int JoyRetries { get; set; } = 3;
+        public double JoyThresholdStart { get; set; } = 0.4;
+        public double JoyThresholdStep { get; set; } = 0.05;
+        public string OpenAiModel { get; set; } = "gpt-4.1-mini";
+        public int OpenAiRetries { get; set; } = 1;
+    }
+
     private static void PrintHelp() {
         Console.WriteLine(
 @"ImageCaptioner (Final: JoyTag server + optional OpenAI, LoRA-friendly tags, always writes .txt)
 
 Usage:
+  ImageCaptioner                  # wizard mode (recommended for .exe)
   ImageCaptioner <dir> [--recursive] [--overwrite] [--quiet]
     [--concurrency N] [--target-bytes BYTES]
     [--min-tags N] [--max-tags N]
@@ -681,6 +1044,9 @@ Usage:
     [--model MODEL] [--openai-retries N]
     [--keep-needtag]
     [--no-reprocess-bad-existing]
+    [--auto-prefix-tags <comma,separated,tags>]
+    [--minimal-subject-tags <comma,separated,tags>]
+    [--auto-start-joytag --joytag-dir D:\tools\joytag --joytag-python D:\tools\joytag\venv\Scripts\python.exe]
 
 Notes:
   - ALWAYS writes .txt (even if tags are few).
@@ -688,10 +1054,10 @@ Notes:
   - LoRA shaping: prefixes first, character features early, background/quality later, dedupe, drop junk.
 
 Recommended:
-  Start JoyTag server (GPU):
-    python -m uvicorn joytag_server:app --host 127.0.0.1 --port 7865
+  Wizard mode auto-saves previous values and can auto-start JoyTag:
+    ImageCaptioner.exe
 
-  Run captioning:
+  CLI run:
     dotnet run -- ""D:\dataset"" --recursive --quiet --concurrency 12 --min-tags 30 --max-tags 80 --target-bytes 3000000 --keep-needtag --joy-url ""http://127.0.0.1:7865""
 ");
     }
