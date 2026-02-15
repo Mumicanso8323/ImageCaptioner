@@ -84,7 +84,7 @@ internal static class Program {
             return 0;
         }
 
-        var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith('-', StringComparison.Ordinal));
+        var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith("-", StringComparison.Ordinal));
         var options = launchWizard
             ? RunWizard()
             : ParseOptions(args);
