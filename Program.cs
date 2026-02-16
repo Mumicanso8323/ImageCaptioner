@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -560,6 +561,8 @@ internal static class Program {
             AutoStartJoyTag = args.Contains("--auto-start-joytag"),
             JoyTagPythonExe = GetArg(args, "--joytag-python"),
             JoyTagWorkingDir = GetArg(args, "--joytag-dir"),
+            JoyAutoPort = args.Contains("--joy-auto-port"),
+            JoyKillConflictProcess = args.Contains("--joy-kill-conflict"),
             DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai")
         };
 
@@ -604,7 +607,9 @@ internal static class Program {
             MinimalSubjectTags = PromptString("失敗時フォールバックタグ", saved.MinimalSubjectTags),
             AutoStartJoyTag = PromptBoolByEmpty("JoyTag自動起動？", saved.AutoStartJoyTag),
             JoyTagWorkingDir = PromptString("JoyTagフォルダ", saved.JoyTagWorkingDir),
-            JoyTagPythonExe = PromptString("JoyTag python.exe", saved.JoyTagPythonExe)
+            JoyTagPythonExe = PromptString("JoyTag python.exe", saved.JoyTagPythonExe),
+            JoyAutoPort = PromptBoolByEmpty("ポート競合時に自動で別ポートを使う？", saved.JoyAutoPort),
+            JoyKillConflictProcess = PromptBoolByEmpty("ポート競合プロセスを自動終了する？", saved.JoyKillConflictProcess)
         };
 
         options.TargetTags = Clamp(options.TargetTags, options.MinTags, options.MaxTags);
@@ -632,6 +637,8 @@ internal static class Program {
             AutoStartJoyTag = options.AutoStartJoyTag,
             JoyTagWorkingDir = options.JoyTagWorkingDir,
             JoyTagPythonExe = options.JoyTagPythonExe,
+            JoyAutoPort = options.JoyAutoPort,
+            JoyKillConflictProcess = options.JoyKillConflictProcess,
             JoyThreshold = options.JoyThreshold,
             JoyThresholdSecondary = options.JoyThresholdSecondary,
             OpenAiModel = options.OpenAiModel,
@@ -660,10 +667,29 @@ internal static class Program {
             return (2, null);
         }
 
-        if (TryGetLocalPort(options.JoyUrl, out var port) && !IsPortAvailable(port)) {
-            Console.Error.WriteLine($"[error] JoyTag URL port {port} is already in use, but JoyTag health check failed.");
-            Console.Error.WriteLine("        別プロセスがポートを使用中の可能性があります。既存プロセス停止 or --joy-url の変更を試してください。");
-            return (2, null);
+        if (TryGetLocalPort(options.JoyUrl, out var requestedPort) && !IsPortAvailable(requestedPort)) {
+            var currentPort = requestedPort;
+            var conflictingPids = GetListeningProcessIds(currentPort).ToArray();
+            if (options.JoyKillConflictProcess && conflictingPids.Length > 0) {
+                Console.WriteLine($"[info] JoyTag URL port {currentPort} is occupied. Trying to kill listener processes: {string.Join(", ", conflictingPids)}");
+                KillProcesses(conflictingPids);
+                await Task.Delay(800);
+            }
+
+            if (!IsPortAvailable(currentPort) && options.JoyAutoPort && TryFindAvailablePort(currentPort + 1, out var fallbackPort) && TryReplaceUrlPort(options.JoyUrl, fallbackPort, out var changedUrl)) {
+                Console.WriteLine($"[info] JoyTag URL port {currentPort} is occupied. Switched to {changedUrl} (--joy-auto-port).");
+                options.JoyUrl = changedUrl;
+                currentPort = fallbackPort;
+            }
+
+            if (!IsPortAvailable(currentPort)) {
+                Console.Error.WriteLine($"[error] JoyTag URL port {currentPort} is already in use, but JoyTag health check failed.");
+                if (conflictingPids.Length > 0) {
+                    Console.Error.WriteLine($"        listener pid: {string.Join(", ", conflictingPids)}");
+                }
+                Console.Error.WriteLine("        --joy-auto-port を有効化して自動ポート変更するか、--joy-kill-conflict で競合プロセスを自動終了してください。");
+                return (2, null);
+            }
         }
 
         var psi = new ProcessStartInfo {
@@ -675,6 +701,9 @@ internal static class Program {
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        if (TryGetLocalPort(options.JoyUrl, out var joyPort)) {
+            psi.Environment["GRADIO_SERVER_PORT"] = joyPort.ToString(CultureInfo.InvariantCulture);
+        }
 
         var process = Process.Start(psi);
         if (process is null) return (2, null);
@@ -736,6 +765,77 @@ internal static class Program {
             return false;
         } finally {
             try { listener?.Stop(); } catch { }
+        }
+    }
+
+    private static bool TryFindAvailablePort(int startPort, out int foundPort) {
+        for (int p = Math.Max(1024, startPort); p <= 65535; p++) {
+            if (IsPortAvailable(p)) {
+                foundPort = p;
+                return true;
+            }
+        }
+        foundPort = 0;
+        return false;
+    }
+
+    private static bool TryReplaceUrlPort(string baseUrl, int newPort, out string replaced) {
+        replaced = baseUrl;
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)) return false;
+        var builder = new UriBuilder(uri) { Port = newPort };
+        replaced = builder.Uri.ToString().TrimEnd('/');
+        return true;
+    }
+
+    private static IEnumerable<int> GetListeningProcessIds(int port) {
+        var pids = new HashSet<int>();
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+            foreach (var line in RunCommandForOutput("netstat", "-ano -p tcp")) {
+                var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length < 5 || !parts[1].EndsWith($":{port}", StringComparison.Ordinal) || !parts[3].Equals("LISTENING", StringComparison.OrdinalIgnoreCase)) continue;
+                if (int.TryParse(parts[4], out var pid) && pid > 0) pids.Add(pid);
+            }
+            return pids;
+        }
+
+        foreach (var line in RunCommandForOutput("lsof", $"-nP -iTCP:{port} -sTCP:LISTEN -t")) {
+            if (int.TryParse(line.Trim(), out var pid) && pid > 0) pids.Add(pid);
+        }
+        if (pids.Count > 0) return pids;
+
+        foreach (var line in RunCommandForOutput("ss", $"-lptn sport = :{port}")) {
+            var m = Regex.Match(line, @"pid=(\d+)");
+            if (m.Success && int.TryParse(m.Groups[1].Value, out var pid) && pid > 0) pids.Add(pid);
+        }
+        return pids;
+    }
+
+    private static IEnumerable<string> RunCommandForOutput(string fileName, string arguments) {
+        try {
+            var psi = new ProcessStartInfo {
+                FileName = fileName,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var process = Process.Start(psi);
+            if (process is null) return [];
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(3000);
+            return output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries);
+        } catch {
+            return [];
+        }
+    }
+
+    private static void KillProcesses(IEnumerable<int> pids) {
+        foreach (var pid in pids.Distinct()) {
+            try {
+                using var process = Process.GetProcessById(pid);
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+            } catch { }
         }
     }
 
@@ -868,6 +968,8 @@ internal static class Program {
         public bool AutoStartJoyTag { get; set; }
         public string? JoyTagPythonExe { get; set; }
         public string? JoyTagWorkingDir { get; set; }
+        public bool JoyAutoPort { get; set; } = true;
+        public bool JoyKillConflictProcess { get; set; }
     }
 
     private sealed class WizardConfig {
@@ -887,6 +989,8 @@ internal static class Program {
         public bool AutoStartJoyTag { get; set; } = true;
         public string JoyTagWorkingDir { get; set; } = @"D:\tools\joytag";
         public string JoyTagPythonExe { get; set; } = @"D:\tools\joytag\venv\Scripts\python.exe";
+        public bool JoyAutoPort { get; set; } = true;
+        public bool JoyKillConflictProcess { get; set; }
         public double JoyThreshold { get; set; } = 0.45;
         public double? JoyThresholdSecondary { get; set; } = 0.35;
         public string OpenAiModel { get; set; } = "gpt-4.1-mini";
@@ -912,6 +1016,7 @@ Usage:
     [--auto-prefix-tags <comma,separated,tags>]
     [--minimal-subject-tags <comma,separated,tags>]
     [--auto-start-joytag --joytag-dir D:\tools\joytag --joytag-python D:\tools\joytag\venv\Scripts\python.exe]
+    [--joy-auto-port] [--joy-kill-conflict]
     [--self-check]
 
 Notes:
