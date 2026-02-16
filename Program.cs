@@ -658,7 +658,7 @@ internal static class Program {
     }
 
     private static async Task<(int ExitCode, Process? AutoStartedProcess)> StartOrReuseJoyTagServerAsync(AppOptions options) {
-        if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+        if ((await CheckJoyTagHealthAsync(options.JoyUrl, CancellationToken.None)).IsAlive) {
             Console.WriteLine("JoyTag is already alive. Reusing existing server.");
             return (0, null);
         }
@@ -729,17 +729,34 @@ internal static class Program {
         var startupWatch = Stopwatch.StartNew();
         var isDetachedWait = false;
         var nextDetachedStatus = TimeSpan.Zero;
+        var nextHealthDiagnostic = TimeSpan.Zero;
+        var lastHealthDiagnosticKey = string.Empty;
 
         while (startupWatch.Elapsed < startupTimeout) {
             var elapsedSeconds = (int)startupWatch.Elapsed.TotalSeconds;
             var isPortListening = TryGetLocalPort(options.JoyUrl, out var joyPortForListen) && IsPortListening(joyPortForListen);
+            var health = await CheckJoyTagHealthAsync(options.JoyUrl, CancellationToken.None);
 
-            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+            if (health.IsAlive) {
                 if (isDetachedWait) {
                     Console.WriteLine("[info] JoyTag became reachable after launcher exit. Continuing with existing server.");
                     return (0, null);
                 }
                 return (0, process);
+            }
+
+            if (startupWatch.Elapsed >= nextHealthDiagnostic) {
+                if (isPortListening && health.HadTimeout) {
+                    Console.WriteLine("[info] Port is listening but HTTP is slow; increasing wait.");
+                }
+                if (health.LastException is not null) {
+                    var key = health.LastException.GetType().Name + ":" + health.LastException.Message;
+                    if (!string.Equals(lastHealthDiagnosticKey, key, StringComparison.Ordinal)) {
+                        Console.WriteLine($"[info] JoyTag health check pending: {health.LastException.GetType().Name}: {health.LastException.Message}");
+                        lastHealthDiagnosticKey = key;
+                    }
+                }
+                nextHealthDiagnostic = startupWatch.Elapsed + TimeSpan.FromSeconds(10);
             }
 
             if (process is not null && process.HasExited) {
@@ -752,10 +769,14 @@ internal static class Program {
                 } else {
                     Console.Error.WriteLine($"[error] JoyTag process exited before ready. exit={exitCode}");
                     if (isPortListening) {
-                        Console.Error.WriteLine("[info] JoyTag URL port is LISTENING, but HTTP health check still fails. Check JoyTag bind host and local firewall settings.");
+                        Console.Error.WriteLine("[info] JoyTag URL port is LISTENING; continuing to wait for HTTP readiness.");
+                        process = null;
+                        isDetachedWait = true;
+                        nextDetachedStatus = TimeSpan.FromSeconds(Math.Max(5, elapsedSeconds + 5));
+                    } else {
+                        PrintRecentJoyTagLogs(stdoutLog, stderrLog);
+                        return (2, null);
                     }
-                    PrintRecentJoyTagLogs(stdoutLog, stderrLog);
-                    return (2, null);
                 }
             }
 
@@ -897,14 +918,37 @@ internal static class Program {
         }
     }
 
-    private static async Task<bool> IsJoyTagAliveAsync(string baseUrl, CancellationToken ct) {
-        try {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(2) };
-            using var resp = await http.GetAsync(baseUrl.TrimEnd('/') + "/", ct);
-            return resp.IsSuccessStatusCode || (int)resp.StatusCode < 500;
-        } catch {
-            return false;
+    private sealed class JoyTagHealthResult {
+        public bool IsAlive { get; init; }
+        public bool HadTimeout { get; init; }
+        public Exception? LastException { get; init; }
+    }
+
+    private static async Task<JoyTagHealthResult> CheckJoyTagHealthAsync(string baseUrl, CancellationToken ct) {
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        var endpoints = new[] { "/", "/docs", "/openapi.json" };
+
+        var hadTimeout = false;
+        Exception? lastException = null;
+        foreach (var endpoint in endpoints) {
+            try {
+                using var resp = await http.GetAsync(baseUrl.TrimEnd('/') + endpoint, ct);
+                if ((int)resp.StatusCode < 500) {
+                    return new JoyTagHealthResult { IsAlive = true };
+                }
+            } catch (OperationCanceledException ex) when (!ct.IsCancellationRequested) {
+                hadTimeout = true;
+                lastException = ex;
+            } catch (Exception ex) {
+                lastException = ex;
+            }
         }
+
+        return new JoyTagHealthResult {
+            IsAlive = false,
+            HadTimeout = hadTimeout,
+            LastException = lastException
+        };
     }
 
     private static void RegisterJoyTagShutdownHandlers(Process process) {
