@@ -1,7 +1,9 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -658,6 +660,12 @@ internal static class Program {
             return (2, null);
         }
 
+        if (TryGetLocalPort(options.JoyUrl, out var port) && !IsPortAvailable(port)) {
+            Console.Error.WriteLine($"[error] JoyTag URL port {port} is already in use, but JoyTag health check failed.");
+            Console.Error.WriteLine("        別プロセスがポートを使用中の可能性があります。既存プロセス停止 or --joy-url の変更を試してください。");
+            return (2, null);
+        }
+
         var psi = new ProcessStartInfo {
             FileName = options.JoyTagPythonExe,
             WorkingDirectory = options.JoyTagWorkingDir,
@@ -671,13 +679,64 @@ internal static class Program {
         var process = Process.Start(psi);
         if (process is null) return (2, null);
 
-        for (int i = 0; i < 40; i++) {
+        var stdoutLog = new ConcurrentQueue<string>();
+        var stderrLog = new ConcurrentQueue<string>();
+        process.OutputDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) EnqueueLog(stdoutLog, e.Data); };
+        process.ErrorDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) EnqueueLog(stderrLog, e.Data); };
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        for (int i = 0; i < 180; i++) {
+            if (process.HasExited) {
+                Console.Error.WriteLine($"[error] JoyTag process exited before ready. exit={process.ExitCode}");
+                PrintRecentJoyTagLogs(stdoutLog, stderrLog);
+                return (2, null);
+            }
             if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) return (0, process);
-            await Task.Delay(500);
+            await Task.Delay(1000);
         }
 
         Console.Error.WriteLine("[error] JoyTag did not become ready in time.");
+        PrintRecentJoyTagLogs(stdoutLog, stderrLog);
         return (2, null);
+    }
+
+    private static void EnqueueLog(ConcurrentQueue<string> queue, string line) {
+        queue.Enqueue(line);
+        while (queue.Count > 40) queue.TryDequeue(out _);
+    }
+
+    private static void PrintRecentJoyTagLogs(ConcurrentQueue<string> stdoutLog, ConcurrentQueue<string> stderrLog) {
+        if (!stdoutLog.IsEmpty) {
+            Console.Error.WriteLine("[info] JoyTag stdout (recent):");
+            foreach (var line in stdoutLog) Console.Error.WriteLine("  " + line);
+        }
+        if (!stderrLog.IsEmpty) {
+            Console.Error.WriteLine("[info] JoyTag stderr (recent):");
+            foreach (var line in stderrLog) Console.Error.WriteLine("  " + line);
+        }
+    }
+
+    private static bool TryGetLocalPort(string baseUrl, out int port) {
+        port = 0;
+        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)) return false;
+        if (!uri.IsLoopback) return false;
+        if (uri.Port is <= 0 or > 65535) return false;
+        port = uri.Port;
+        return true;
+    }
+
+    private static bool IsPortAvailable(int port) {
+        TcpListener? listener = null;
+        try {
+            listener = new TcpListener(IPAddress.Loopback, port);
+            listener.Start();
+            return true;
+        } catch (SocketException) {
+            return false;
+        } finally {
+            try { listener?.Stop(); } catch { }
+        }
     }
 
     private static async Task<bool> IsJoyTagAliveAsync(string baseUrl, CancellationToken ct) {
