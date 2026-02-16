@@ -23,6 +23,13 @@ internal static class Program {
     private static readonly HashSet<string> SubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
         "1girl", "1boy", "solo", "multiple_girls", "multiple_boys", "2girls", "2boys", "girl", "boy"
     };
+    private static readonly HashSet<string> MaleSubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
+        "boy", "1boy", "2boys", "3boys", "4boys", "multiple_boys"
+    };
+    private static readonly HashSet<string> BlockedFinalSubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
+        "boy", "1boy", "2boys", "3boys", "4boys", "multiple_boys"
+    };
+    private static readonly object ReviewLogLock = new();
 
     private static readonly Regex CharacterNameRegex = new(@"^[a-z0-9]+(_[a-z0-9]+){1,3}$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex FaceHairEyesRegex = new(@"(hair|eyes|eyebrows|eyelashes|pupil|bangs|twintails|ponytail|braid|ahoge|blush|smile|frown|angry|surprised|open_mouth|closed_mouth|tears|looking_)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -54,8 +61,9 @@ internal static class Program {
                 return ExitWithErrorPause(ok ? 0 : 1);
             }
 
-            var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith("-", StringComparison.Ordinal));
-            var options = launchWizard ? RunWizard() : ParseOptions(args);
+            var useLast = args.Contains("--use-last");
+            var launchWizard = args.Length == 0 || args.Contains("--wizard");
+            var options = launchWizard ? RunWizard() : ParseOptions(args, useLast);
             if (options is null) return ExitWithErrorPause(2);
 
         HardPrefixTags = SplitTags(options.AutoPrefixTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
@@ -108,30 +116,30 @@ internal static class Program {
 
                 var (mime, bytes) = await LoadAndMaybeCompressAsync(imagePath, options.TargetBytes, ct);
 
-                var joyPrimary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThreshold, ct);
+                var joyPrimary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThreshold, TagSource.PrimaryJoy, ct);
                 var joyCandidates = joyPrimary.Tags;
 
-                if (joyCandidates.Count < options.TargetTags / 2 && options.JoyThresholdSecondary.HasValue) {
-                    var joySecondary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThresholdSecondary.Value, ct);
-                    var secondaryTop = joySecondary.Tags.Take(Math.Max(8, options.TargetTags / 2));
-                    joyCandidates = MergeCandidateTags(joyCandidates, secondaryTop);
+                if (options.JoyThresholdSecondary.HasValue) {
+                    var joySecondary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThresholdSecondary.Value, TagSource.SecondaryJoy, ct);
+                    joyCandidates = MergeCandidateTags(joyCandidates, joySecondary.Tags);
                 }
 
                 var selectedFromJoy = SelectTags(joyCandidates, options);
                 bool needOpenAi = !options.DisableOpenAi
                     && !string.IsNullOrWhiteSpace(options.ApiKey)
-                    && (selectedFromJoy.Count < options.MinTags || MissingCoreBuckets(selectedFromJoy));
+                    && (selectedFromJoy.Tags.Count < options.MinTags || MissingCoreBuckets(selectedFromJoy.Tags));
 
                 var finalCandidates = joyCandidates;
                 if (needOpenAi) {
                     var openText = await OpenAiRetryAsync(httpOpenAI, options.OpenAiModel, mime, bytes, options.OpenAiRetries, ct);
-                    var openCandidates = ParseTagCandidatesFromLine(openText, null, sourceWeight: 0.7);
+                    var openCandidates = ParseTagCandidatesFromLine(openText, null, sourceWeight: 0.7, source: TagSource.OpenAI);
                     finalCandidates = MergeCandidateTags(joyCandidates, openCandidates);
                 }
 
-                var finalTags = SelectTags(finalCandidates, options);
+                var finalSelection = SelectTags(finalCandidates, options);
+                var finalTags = finalSelection.Tags;
                 if (finalTags.Count < 3)
-                    finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0), options);
+                    finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
 
                 var line = string.Join(", ", finalTags);
                 await File.WriteAllTextAsync(txtPath, line + Environment.NewLine, new UTF8Encoding(false), ct);
@@ -140,9 +148,17 @@ internal static class Program {
                 if (isLow) {
                     Interlocked.Increment(ref low);
                     if (options.KeepNeedtag)
-                        await File.WriteAllTextAsync(needPath, "low tags; check later" + Environment.NewLine, new UTF8Encoding(false), ct);
+                        await File.WriteAllTextAsync(needPath, "low tags; short caption or missing core; check later" + Environment.NewLine, new UTF8Encoding(false), ct);
                 } else {
                     TryDelete(needPath);
+                }
+
+                var review = BuildReviewRecord(imagePath, txtPath, joyCandidates, finalSelection, options);
+                if (review is not null) {
+                    AppendReviewLog(options.Dir, review);
+                    if (!string.IsNullOrWhiteSpace(options.ReviewCopyDir)) {
+                        TryCopyReviewArtifacts(options.ReviewCopyDir!, imagePath, txtPath);
+                    }
                 }
 
                 Interlocked.Increment(ref okCount);
@@ -151,7 +167,7 @@ internal static class Program {
                 errors.Add($"[fail] {Path.GetFileName(imagePath)}: {ex.Message}");
                 try {
                     if (!File.Exists(txtPath)) {
-                        var fb = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0), options);
+                        var fb = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
                         await File.WriteAllTextAsync(txtPath, string.Join(", ", fb) + Environment.NewLine, new UTF8Encoding(false), ct);
                     }
                     if (options.KeepNeedtag)
@@ -167,6 +183,7 @@ internal static class Program {
                 if (errors.Count > 20) Console.WriteLine($"(and {errors.Count - 20} more)");
             }
 
+            SaveWizardConfig(ToWizardConfig(options));
             return ExitWithErrorPause(failed == 0 ? 0 : 1);
         } catch (Exception ex) {
             Console.Error.WriteLine("Fatal error occurred.");
@@ -192,24 +209,57 @@ internal static class Program {
         public string Tag { get; init; } = "";
         public double Score { get; init; }
         public int Order { get; init; }
+        public TagSource Source { get; init; } = TagSource.PrimaryJoy;
+    }
+
+    private enum TagSource { PrimaryJoy, SecondaryJoy, OpenAI }
+
+    private sealed class SelectionResult {
+        public List<string> Tags { get; init; } = [];
+        public List<string> DroppedMaleSubjectTags { get; init; } = [];
+    }
+
+    private sealed class ReviewRecord {
+        public string ImagePath { get; init; } = "";
+        public string CaptionPath { get; init; } = "";
+        public List<string> Reasons { get; init; } = [];
+        public List<string> DetectedSubjectTokens { get; init; } = [];
+        public List<string> DroppedTags { get; init; } = [];
+        public int FinalTagCount { get; init; }
+        public double PrimaryThreshold { get; init; }
+        public double? SecondaryThreshold { get; init; }
+        public List<string> TopJoyTags { get; init; } = [];
     }
 
     private static List<TagCandidate> MergeCandidateTags(IEnumerable<TagCandidate> a, IEnumerable<TagCandidate> b) {
         var map = new Dictionary<string, TagCandidate>(StringComparer.OrdinalIgnoreCase);
         foreach (var c in a.Concat(b)) {
-            if (!map.TryGetValue(c.Tag, out var old) || c.Score > old.Score) map[c.Tag] = c;
+            if (!map.TryGetValue(c.Tag, out var old)) {
+                map[c.Tag] = c;
+                continue;
+            }
+
+            var bestScore = c.Score > old.Score ? c : old;
+            var earliestOrder = Math.Min(old.Order, c.Order);
+            var source = PreferSource(old.Source, c.Source, Math.Abs(old.Score - c.Score) <= 0.03 ? old.Score : bestScore.Score, Math.Abs(old.Score - c.Score) <= 0.03 ? c.Score : bestScore.Score);
+            map[c.Tag] = new TagCandidate {
+                Tag = bestScore.Tag,
+                Score = Math.Max(old.Score, c.Score),
+                Order = earliestOrder,
+                Source = source
+            };
         }
-        return map.Values.OrderByDescending(x => x.Score).ThenBy(x => x.Order).ToList();
+        return map.Values.OrderByDescending(x => x.Score).ThenBy(x => SourceRank(x.Source)).ThenBy(x => x.Order).ToList();
     }
 
-    private static (List<TagCandidate> Tags, bool HasScore) ParseJoyTags(JsonElement tagsEl) {
+    private static (List<TagCandidate> Tags, bool HasScore) ParseJoyTags(JsonElement tagsEl, TagSource source) {
         var list = new List<TagCandidate>();
         bool hasScore = false;
         int order = 0;
         foreach (var t in tagsEl.EnumerateArray()) {
             if (t.ValueKind == JsonValueKind.String) {
                 var s = NormalizeTag(t.GetString() ?? "");
-                if (!string.IsNullOrWhiteSpace(s)) list.Add(new TagCandidate { Tag = s, Score = Math.Max(0.01, 1.0 - order * 0.001), Order = order++ });
+                if (!string.IsNullOrWhiteSpace(s)) list.Add(new TagCandidate { Tag = s, Score = Math.Max(0.01, 1.0 - order * 0.001), Order = order++, Source = source });
                 continue;
             }
             if (t.ValueKind != JsonValueKind.Object) continue;
@@ -223,14 +273,14 @@ internal static class Program {
             else if (t.TryGetProperty("confidence", out var confEl) && confEl.TryGetDouble(out var conf)) { score = conf; hasScore = true; }
 
             var n = NormalizeTag(tag ?? "");
-            if (!string.IsNullOrWhiteSpace(n)) list.Add(new TagCandidate { Tag = n, Score = score, Order = order++ });
+            if (!string.IsNullOrWhiteSpace(n)) list.Add(new TagCandidate { Tag = n, Score = score, Order = order++, Source = source });
         }
 
         if (hasScore) list = list.OrderByDescending(x => x.Score).ThenBy(x => x.Order).ToList();
         return (list, hasScore);
     }
 
-    private static async Task<(List<TagCandidate> Tags, bool HasScore)> CallJoyTagAsync(HttpClient http, string baseUrl, byte[] imageBytes, double threshold, CancellationToken ct) {
+    private static async Task<(List<TagCandidate> Tags, bool HasScore)> CallJoyTagAsync(HttpClient http, string baseUrl, byte[] imageBytes, double threshold, TagSource source, CancellationToken ct) {
         var url = $"{baseUrl.TrimEnd('/')}/tag?threshold={threshold:0.00}";
         using var form = new MultipartFormDataContent();
         var file = new ByteArrayContent(imageBytes);
@@ -244,7 +294,7 @@ internal static class Program {
         if (!doc.RootElement.TryGetProperty("tags", out var tagsEl) || tagsEl.ValueKind != JsonValueKind.Array)
             return (new List<TagCandidate>(), false);
 
-        return ParseJoyTags(tagsEl);
+        return ParseJoyTags(tagsEl, source);
     }
 
     private static async Task<string> OpenAiRetryAsync(HttpClient http, string model, string mime, byte[] imageBytes, int retries, CancellationToken ct) {
@@ -301,7 +351,7 @@ internal static class Program {
         return "";
     }
 
-    private static List<TagCandidate> ParseTagCandidatesFromLine(string raw, double? defaultScore, double sourceWeight) {
+    private static List<TagCandidate> ParseTagCandidatesFromLine(string raw, double? defaultScore, double sourceWeight, TagSource source = TagSource.OpenAI) {
         var norm = NormalizeRawTagLine(raw);
         var list = new List<TagCandidate>();
         int i = 0;
@@ -309,7 +359,8 @@ internal static class Program {
             list.Add(new TagCandidate {
                 Tag = t,
                 Score = (defaultScore ?? Math.Max(0.05, 1.0 - i * 0.01)) * sourceWeight,
-                Order = i++
+                Order = i++,
+                Source = source
             });
         }
         return list;
@@ -333,8 +384,7 @@ internal static class Program {
         return string.Join(", ", tags);
     }
 
-    private static List<string> SelectTags(List<TagCandidate> candidates, AppOptions options) {
-        int target = Clamp(options.TargetTags, options.MinTags, options.MaxTags);
+    private static SelectionResult SelectTags(List<TagCandidate> candidates, AppOptions options) {
         var caps = new Dictionary<TagBucket, int> {
             [TagBucket.Identity] = 3,
             [TagBucket.FaceHairEyes] = 8,
@@ -344,15 +394,41 @@ internal static class Program {
             [TagBucket.StyleQuality] = options.MaxQualityTags
         };
 
+        var droppedMale = candidates
+            .Select(c => NormalizeTag(c.Tag))
+            .Where(t => !string.IsNullOrWhiteSpace(t) && BlockedFinalSubjectTokens.Contains(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
         var unique = new Dictionary<string, TagCandidate>(StringComparer.OrdinalIgnoreCase);
         foreach (var c in candidates) {
             var n = NormalizeTag(c.Tag);
             if (string.IsNullOrWhiteSpace(n) || ShouldDropTag(n)) continue;
-            var normalized = new TagCandidate { Tag = n, Score = c.Score, Order = c.Order };
-            if (!unique.TryGetValue(n, out var old) || normalized.Score > old.Score) unique[n] = normalized;
+            var normalized = new TagCandidate { Tag = n, Score = c.Score, Order = c.Order, Source = c.Source };
+            if (!unique.TryGetValue(n, out var old)) {
+                unique[n] = normalized;
+                continue;
+            }
+
+            var prefer = normalized.Score > old.Score ? normalized : old;
+            if (Math.Abs(normalized.Score - old.Score) <= 0.03) {
+                prefer = SourceRank(normalized.Source) < SourceRank(old.Source) ? normalized : old;
+            }
+            unique[n] = new TagCandidate {
+                Tag = prefer.Tag,
+                Score = Math.Max(normalized.Score, old.Score),
+                Order = Math.Min(normalized.Order, old.Order),
+                Source = prefer.Source
+            };
         }
 
-        var sorted = unique.Values.OrderByDescending(x => x.Score).ThenBy(x => x.Order).ToList();
+        var sorted = unique.Values
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => SourceRank(x.Source))
+            .ThenBy(x => x.Order)
+            .ToList();
+
         var grouped = new Dictionary<TagBucket, List<TagCandidate>>();
         foreach (TagBucket b in Enum.GetValues<TagBucket>()) grouped[b] = [];
         foreach (var c in sorted) grouped[ClassifyTag(c.Tag)].Add(c);
@@ -361,12 +437,11 @@ internal static class Program {
         var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         AddIfPresent(HardPrefixTags);
+        AddOne("1girl");
 
-        // force stable subject near front
-        var subject = grouped[TagBucket.Identity].FirstOrDefault(x => SubjectTokens.Contains(x.Tag));
-        if (subject is not null) AddOne(subject.Tag);
+        var dynamicCutoff = ComputeDynamicCutoff(sorted, options);
 
-        // fill bucket quotas in priority order
+        // Variable-length strategy: fill useful buckets first, then stop when score quality drops.
         FillBucket(TagBucket.Identity, caps[TagBucket.Identity]);
         FillBucket(TagBucket.FaceHairEyes, caps[TagBucket.FaceHairEyes]);
         FillBucket(TagBucket.Outfit, caps[TagBucket.Outfit]);
@@ -374,21 +449,24 @@ internal static class Program {
         FillBucket(TagBucket.Background, caps[TagBucket.Background]);
         FillBucket(TagBucket.StyleQuality, caps[TagBucket.StyleQuality]);
 
-        // fill remainder best-first, never over max
         foreach (var c in sorted) {
-            if (result.Count >= target) break;
+            if (result.Count >= options.MaxTags) break;
+            if (c.Score < dynamicCutoff) break;
             AddOne(c.Tag);
         }
 
-        if (result.Count > options.MaxTags)
-            result = result.Take(options.MaxTags).ToList();
+        if (!result.Contains("1girl", StringComparer.OrdinalIgnoreCase)) {
+            if (result.Count >= options.MaxTags && result.Count > 0) result.RemoveAt(result.Count - 1);
+            result.Insert(Math.Min(result.Count, HardPrefixTags.Length), "1girl");
+        }
 
-        return result;
+        return new SelectionResult { Tags = result, DroppedMaleSubjectTags = droppedMale };
 
         void FillBucket(TagBucket bucket, int cap) {
             int used = 0;
             foreach (var c in grouped[bucket]) {
-                if (result.Count >= target || used >= cap) break;
+                if (result.Count >= options.MaxTags || used >= cap) break;
+                if (c.Score < dynamicCutoff) continue;
                 if (AddOne(c.Tag)) used++;
             }
         }
@@ -403,6 +481,99 @@ internal static class Program {
             result.Add(tag);
             return true;
         }
+    }
+
+    private static double ComputeDynamicCutoff(List<TagCandidate> sorted, AppOptions options) {
+        if (sorted.Count == 0) return double.MaxValue;
+        var topScore = sorted[0].Score;
+        var p70Idx = (int)Math.Floor((sorted.Count - 1) * 0.70);
+        var p70 = sorted[p70Idx].Score;
+        var secondaryFloor = options.JoyThresholdSecondary ?? options.JoyThreshold;
+        return Math.Max(secondaryFloor, Math.Max(topScore * 0.55, p70));
+    }
+
+    private static int SourceRank(TagSource source) => source switch {
+        TagSource.PrimaryJoy => 0,
+        TagSource.SecondaryJoy => 1,
+        TagSource.OpenAI => 2,
+        _ => 3
+    };
+
+    private static TagSource PreferSource(TagSource a, TagSource b, double scoreA, double scoreB) {
+        if (Math.Abs(scoreA - scoreB) > 0.03) return scoreA >= scoreB ? a : b;
+        return SourceRank(a) <= SourceRank(b) ? a : b;
+    }
+
+    private static ReviewRecord? BuildReviewRecord(string imagePath, string txtPath, List<TagCandidate> rawCandidates, SelectionResult selection, AppOptions options) {
+        var subjectTokens = rawCandidates
+            .Select(c => NormalizeTag(c.Tag))
+            .Where(t => SubjectTokens.Contains(t) || t.Contains("boys", StringComparison.OrdinalIgnoreCase) || t.Contains("girls", StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var reasons = new List<string>();
+        bool hasMale = subjectTokens.Any(t => MaleSubjectTokens.Contains(t));
+        bool hasMulti = subjectTokens.Any(t => t.StartsWith("multiple_", StringComparison.OrdinalIgnoreCase) || Regex.IsMatch(t, @"^\d+(girl|girls|boy|boys)$", RegexOptions.IgnoreCase));
+        bool hasGirl = subjectTokens.Any(t => t.Contains("girl", StringComparison.OrdinalIgnoreCase));
+
+        if (hasMale) reasons.Add("male_subject_token");
+        if (hasMulti || (hasMale && hasGirl)) reasons.Add("mixed_subject_tokens");
+
+        var hasPortraitContext = rawCandidates.Any(c => {
+            var t = NormalizeTag(c.Tag);
+            return t.Contains("face") || t.Contains("portrait") || t.Contains("close-up") || t.Contains("looking_at_viewer");
+        });
+        if (hasMale && hasPortraitContext) reasons.Add("male_face_context");
+
+        if (reasons.Count == 0) return null;
+
+        return new ReviewRecord {
+            ImagePath = imagePath,
+            CaptionPath = txtPath,
+            Reasons = reasons.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+            DetectedSubjectTokens = subjectTokens,
+            DroppedTags = selection.DroppedMaleSubjectTags,
+            FinalTagCount = selection.Tags.Count,
+            PrimaryThreshold = options.JoyThreshold,
+            SecondaryThreshold = options.JoyThresholdSecondary,
+            TopJoyTags = rawCandidates.OrderByDescending(c => c.Score).ThenBy(c => c.Order).Take(10).Select(c => c.Tag).ToList()
+        };
+    }
+
+    // Review logging is append-only so generation never blocks; manual cleanup happens later.
+    private static void AppendReviewLog(string datasetRoot, ReviewRecord record) {
+        var jsonlPath = Path.Combine(datasetRoot, "review_candidates.jsonl");
+        var csvPath = Path.Combine(datasetRoot, "review_candidates.csv");
+        var jsonLine = JsonSerializer.Serialize(record);
+        var csvLine = string.Join(",", [
+            Csv(record.ImagePath), Csv(record.CaptionPath), Csv(string.Join(";", record.Reasons)), Csv(string.Join(";", record.DetectedSubjectTokens)),
+            Csv(string.Join(";", record.DroppedTags)), Csv(record.FinalTagCount.ToString(CultureInfo.InvariantCulture)),
+            Csv(record.PrimaryThreshold.ToString("0.00", CultureInfo.InvariantCulture)), Csv((record.SecondaryThreshold?.ToString("0.00", CultureInfo.InvariantCulture)) ?? ""),
+            Csv(string.Join(";", record.TopJoyTags))
+        ]);
+
+        lock (ReviewLogLock) {
+            File.AppendAllText(jsonlPath, jsonLine + Environment.NewLine, new UTF8Encoding(false));
+            if (!File.Exists(csvPath) || new FileInfo(csvPath).Length == 0) {
+                File.AppendAllText(csvPath, "image_path,caption_path,reasons,detected_subject_tokens,dropped_tags,final_tag_count,primary_threshold,secondary_threshold,top_joy_tags" + Environment.NewLine, new UTF8Encoding(false));
+            }
+            File.AppendAllText(csvPath, csvLine + Environment.NewLine, new UTF8Encoding(false));
+        }
+    }
+
+    private static void TryCopyReviewArtifacts(string reviewCopyDir, string imagePath, string txtPath) {
+        try {
+            Directory.CreateDirectory(reviewCopyDir);
+            var name = Path.GetFileName(imagePath);
+            var txtName = Path.GetFileName(txtPath);
+            File.Copy(imagePath, Path.Combine(reviewCopyDir, name), overwrite: true);
+            if (File.Exists(txtPath)) File.Copy(txtPath, Path.Combine(reviewCopyDir, txtName), overwrite: true);
+        } catch { }
+    }
+
+    private static string Csv(string s) {
+        var escaped = s.Replace(""", """");
+        return $""{escaped}"";
     }
 
     private static bool MissingCoreBuckets(List<string> tags) {
@@ -434,6 +605,7 @@ internal static class Program {
         if (DropTagsContains.Any(lower.Contains)) return true;
         if (lower.StartsWith("rating:")) return true;
         if (BuiltinDenyTags.Contains(lower)) return true;
+        if (BlockedFinalSubjectTokens.Contains(lower)) return true;
         if (DenylistTags.Contains(lower)) return true;
         if (AllowlistTags.Count > 0 && !AllowlistTags.Contains(lower) && (lower.StartsWith("rating") || lower.Contains("watermark"))) return true;
         return false;
@@ -534,8 +706,39 @@ internal static class Program {
         return ("image/jpeg", best);
     }
 
-    private static AppOptions? ParseOptions(string[] args) {
-        var dir = args[0];
+    private static AppOptions? ParseOptions(string[] args, bool useLast) {
+        var saved = LoadWizardConfig();
+        var dirArg = GetArg(args, "--dir");
+        var positionalDir = args.FirstOrDefault(a => !a.StartsWith("-", StringComparison.Ordinal));
+        var resolvedDir = dirArg ?? positionalDir;
+
+        if (useLast) {
+            var fromSaved = BuildOptionsFromWizardConfig(saved);
+            if (!string.IsNullOrWhiteSpace(resolvedDir)) fromSaved.Dir = resolvedDir;
+            if (string.IsNullOrWhiteSpace(fromSaved.Dir)) {
+                Console.Error.WriteLine("No directory resolved for --use-last. Set it in wizard first or pass --dir <path>.");
+                return null;
+            }
+            if (!Directory.Exists(fromSaved.Dir)) { Console.Error.WriteLine($"Directory not found: {fromSaved.Dir}"); return null; }
+
+            fromSaved.Recursive = args.Contains("--recursive") ? true : fromSaved.Recursive;
+            fromSaved.Overwrite = args.Contains("--overwrite") ? true : fromSaved.Overwrite;
+            fromSaved.Quiet = args.Contains("--quiet") ? true : fromSaved.Quiet;
+            fromSaved.DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai") || fromSaved.DisableOpenAi;
+            fromSaved.ReviewCopyDir = GetArg(args, "--review-copy-dir") ?? fromSaved.ReviewCopyDir;
+
+            var apiKeySaved = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+            if (fromSaved.DisableOpenAi) apiKeySaved = null;
+            fromSaved.ApiKey = apiKeySaved;
+            if (!HasUserDefinedMinimumTags(fromSaved)) return null;
+            return fromSaved;
+        }
+
+        if (string.IsNullOrWhiteSpace(positionalDir)) {
+            Console.Error.WriteLine("Directory not found: (missing positional dir). Use --use-last or pass a directory.");
+            return null;
+        }
+        var dir = positionalDir;
         if (!Directory.Exists(dir)) { Console.Error.WriteLine($"Directory not found: {dir}"); return null; }
 
         var options = new AppOptions {
@@ -563,7 +766,8 @@ internal static class Program {
             JoyTagWorkingDir = GetArg(args, "--joytag-dir"),
             JoyAutoPort = args.Contains("--joy-auto-port"),
             JoyKillConflictProcess = args.Contains("--joy-kill-conflict"),
-            DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai")
+            DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai"),
+            ReviewCopyDir = GetArg(args, "--review-copy-dir")
         };
 
         if (options.MaxTags < options.MinTags) options.MaxTags = options.MinTags;
@@ -575,6 +779,37 @@ internal static class Program {
 
         if (!HasUserDefinedMinimumTags(options)) return null;
         return options;
+    }
+
+    private static AppOptions BuildOptionsFromWizardConfig(WizardConfig saved) {
+        return new AppOptions {
+            Dir = saved.LastDir,
+            Recursive = saved.Recursive,
+            Overwrite = saved.Overwrite,
+            Quiet = saved.Quiet,
+            KeepNeedtag = saved.KeepNeedtag,
+            Concurrency = saved.Concurrency,
+            MinTags = saved.MinTags,
+            MaxTags = saved.MaxTags,
+            TargetTags = saved.TargetTags,
+            TargetBytes = saved.TargetBytes,
+            JoyUrl = saved.JoyUrl,
+            JoyThreshold = saved.JoyThreshold,
+            JoyThresholdSecondary = saved.JoyThresholdSecondary,
+            MaxQualityTags = saved.MaxQualityTags,
+            OpenAiModel = saved.OpenAiModel,
+            OpenAiRetries = saved.OpenAiRetries,
+            DisableOpenAi = saved.DisableOpenAi,
+            ReprocessBadExisting = true,
+            AutoPrefixTags = saved.AutoPrefixTags,
+            MinimalSubjectTags = saved.MinimalSubjectTags,
+            AutoStartJoyTag = saved.AutoStartJoyTag,
+            JoyTagWorkingDir = saved.JoyTagWorkingDir,
+            JoyTagPythonExe = saved.JoyTagPythonExe,
+            JoyAutoPort = saved.JoyAutoPort,
+            JoyKillConflictProcess = saved.JoyKillConflictProcess,
+            ReviewCopyDir = saved.ReviewCopyDir
+        };
     }
 
     private static AppOptions? RunWizard() {
@@ -609,7 +844,8 @@ internal static class Program {
             JoyTagWorkingDir = PromptString("JoyTagフォルダ", saved.JoyTagWorkingDir),
             JoyTagPythonExe = PromptString("JoyTag python.exe", saved.JoyTagPythonExe),
             JoyAutoPort = PromptBoolByEmpty("ポート競合時に自動で別ポートを使う？", saved.JoyAutoPort),
-            JoyKillConflictProcess = PromptBoolByEmpty("ポート競合プロセスを自動終了する？", saved.JoyKillConflictProcess)
+            JoyKillConflictProcess = PromptBoolByEmpty("ポート競合プロセスを自動終了する？", saved.JoyKillConflictProcess),
+            ReviewCopyDir = PromptString("レビュー用コピー先フォルダ(空で無効)", saved.ReviewCopyDir)
         };
 
         options.TargetTags = Clamp(options.TargetTags, options.MinTags, options.MaxTags);
@@ -620,32 +856,7 @@ internal static class Program {
 
         if (!HasUserDefinedMinimumTags(options)) return null;
 
-        SaveWizardConfig(new WizardConfig {
-            LastDir = options.Dir,
-            JoyUrl = options.JoyUrl,
-            Concurrency = options.Concurrency,
-            MinTags = options.MinTags,
-            MaxTags = options.MaxTags,
-            TargetTags = options.TargetTags,
-            TargetBytes = options.TargetBytes,
-            Recursive = options.Recursive,
-            Overwrite = options.Overwrite,
-            Quiet = options.Quiet,
-            KeepNeedtag = options.KeepNeedtag,
-            AutoPrefixTags = options.AutoPrefixTags,
-            MinimalSubjectTags = options.MinimalSubjectTags,
-            AutoStartJoyTag = options.AutoStartJoyTag,
-            JoyTagWorkingDir = options.JoyTagWorkingDir,
-            JoyTagPythonExe = options.JoyTagPythonExe,
-            JoyAutoPort = options.JoyAutoPort,
-            JoyKillConflictProcess = options.JoyKillConflictProcess,
-            JoyThreshold = options.JoyThreshold,
-            JoyThresholdSecondary = options.JoyThresholdSecondary,
-            OpenAiModel = options.OpenAiModel,
-            OpenAiRetries = options.OpenAiRetries,
-            MaxQualityTags = options.MaxQualityTags,
-            DisableOpenAi = options.DisableOpenAi
-        });
+        SaveWizardConfig(ToWizardConfig(options));
 
         return options;
     }
@@ -972,7 +1183,7 @@ internal static class Program {
         HardPrefixTags = SplitTags(options.AutoPrefixTags).ToArray();
 
         var candidates = ParseTagCandidatesFromLine("1girl, solo, blue_hair, long_hair, blue_eyes, smile, school_uniform, standing, classroom, masterpiece, best_quality, highres, watermark", null, 1.0);
-        var tags = SelectTags(candidates, options);
+        var tags = SelectTags(candidates, options).Tags;
 
         bool prefixFirst = tags.Count > 0 && tags[0] == "trigger_token";
         bool hasSubjectEarly = tags.Take(3).Contains("1girl");
@@ -1046,6 +1257,36 @@ internal static class Program {
         } catch { }
     }
 
+    private static WizardConfig ToWizardConfig(AppOptions options) {
+        return new WizardConfig {
+            LastDir = options.Dir,
+            JoyUrl = options.JoyUrl,
+            Concurrency = options.Concurrency,
+            MinTags = options.MinTags,
+            MaxTags = options.MaxTags,
+            TargetTags = options.TargetTags,
+            TargetBytes = options.TargetBytes,
+            Recursive = options.Recursive,
+            Overwrite = options.Overwrite,
+            Quiet = options.Quiet,
+            KeepNeedtag = options.KeepNeedtag,
+            AutoPrefixTags = options.AutoPrefixTags,
+            MinimalSubjectTags = options.MinimalSubjectTags,
+            AutoStartJoyTag = options.AutoStartJoyTag,
+            JoyTagWorkingDir = options.JoyTagWorkingDir ?? "",
+            JoyTagPythonExe = options.JoyTagPythonExe ?? "",
+            JoyAutoPort = options.JoyAutoPort,
+            JoyKillConflictProcess = options.JoyKillConflictProcess,
+            JoyThreshold = options.JoyThreshold,
+            JoyThresholdSecondary = options.JoyThresholdSecondary,
+            OpenAiModel = options.OpenAiModel,
+            OpenAiRetries = options.OpenAiRetries,
+            MaxQualityTags = options.MaxQualityTags,
+            DisableOpenAi = options.DisableOpenAi,
+            ReviewCopyDir = options.ReviewCopyDir ?? ""
+        };
+    }
+
     private sealed class AppOptions {
         public string Dir { get; set; } = "";
         public bool Recursive { get; set; } = true;
@@ -1073,6 +1314,7 @@ internal static class Program {
         public string? JoyTagWorkingDir { get; set; }
         public bool JoyAutoPort { get; set; } = true;
         public bool JoyKillConflictProcess { get; set; }
+        public string? ReviewCopyDir { get; set; }
     }
 
     private sealed class WizardConfig {
@@ -1100,6 +1342,7 @@ internal static class Program {
         public int OpenAiRetries { get; set; } = 1;
         public int MaxQualityTags { get; set; } = 2;
         public bool DisableOpenAi { get; set; }
+        public string ReviewCopyDir { get; set; } = "";
     }
 
     private static void PrintHelp() {
@@ -1120,13 +1363,16 @@ Usage:
     [--minimal-subject-tags <comma,separated,tags>]
     [--auto-start-joytag --joytag-dir D:\tools\joytag --joytag-python D:\tools\joytag\venv\Scripts\python.exe]
     [--joy-auto-port] [--joy-kill-conflict]
+    [--review-copy-dir <dir>]
+    [--use-last] [--dir <path>]
     [--self-check]
 
 Notes:
   - Caption output is always one line: tag1, tag2, ...
   - Default caption range is short and stable for LoRA (15-35 tags, target 25).
-  - JoyTag is called once (optional secondary threshold once); no threshold chasing loop.
+  - JoyTag uses primary + optional secondary pass and merges by normalized tag (higher score wins).
   - OpenAI is optional fallback only when core buckets are missing or user enables it.
-  - allowlist.txt / denylist.txt in working directory are loaded at startup (denylist wins).");
+  - allowlist.txt / denylist.txt in working directory are loaded at startup (denylist wins).
+  - Final captions always force 1girl and remove male-subject tokens (logged for review).");
     }
 }
