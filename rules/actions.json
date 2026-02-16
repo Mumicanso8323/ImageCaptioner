@@ -1,69 +1,32 @@
-{
-  "oral": {
-    "parent": ["blowjob", "cunnilingus", "anal_licking"],
+[
+  {
+    "parent_tag": "footjob",
+    "required_all": ["penis", "feet"],
+    "required_any": [],
+    "forbidden_any": ["vaginal_penetration", "anal_penetration"],
     "subtypes": [
-      "deepthroat_from_above",
-      "forced_cunnilingus",
-      "penis_kiss",
-      "tongue_on_foreskin",
-      "nipple_licking",
-      "nipple_licking_on_penis"
+      { "tag": "penis_between_feet", "match_any": ["between_feet", "foot_sandwich"], "match_all": [] },
+      { "tag": "foot_on_penis", "match_any": ["foot_on_penis", "foot_press"], "match_all": [] },
+      { "tag": "foot_sole_stimulation", "match_any": ["sole", "foot_sole", "sole_focus"], "match_all": [] }
     ]
   },
-
-  "manual": {
-    "parent": ["handjob"],
+  {
+    "parent_tag": "handjob",
+    "required_all": ["penis", "hand"],
+    "required_any": [],
+    "forbidden_any": ["vaginal_penetration", "anal_penetration"],
     "subtypes": [
-      "fast_handjob",
-      "one_hand_handjob",
-      "two_hand_handjob",
-      "prone_handjob",
-      "strong_grip_on_penis",
-      "glans_grab",
-      "palm_over_glans"
+      { "tag": "penis_in_hand", "match_any": ["penis_in_hand", "holding_penis"], "match_all": [] },
+      { "tag": "hand_wrapping_penis", "match_any": ["grip", "gripping"], "match_all": [] }
     ]
   },
-
-  "breast": {
-    "parent": ["breast_job"],
+  {
+    "parent_tag": "blowjob",
+    "required_all": ["penis"],
+    "required_any": ["mouth", "oral", "sucking"],
+    "forbidden_any": [],
     "subtypes": [
-      "lying_paizuri",
-      "pressing_paizuri",
-      "overbreast_paizuri",
-      "paizuri_under_clothes"
-    ]
-  },
-
-  "leg_based": {
-    "parent": ["thigh_job", "footjob"],
-    "subtypes": [
-      "lying_thigh_job",
-      "diamond_leg_lock",
-      "thigh_scissor_hold",
-      "knee_lock",
-      "penis_between_feet",
-      "footjob_while_trampling"
-    ]
-  },
-
-  "penetration": {
-    "parent": ["cowgirl"],
-    "subtypes": [
-      "m_spread",
-      "m_spread_on_all_fours",
-      "smothering_cowgirl",
-      "partial_penetration",
-      "full_penetration",
-      "thrusting"
-    ]
-  },
-
-  "fluid_events": {
-    "parent": ["ejaculation"],
-    "subtypes": [
-      "semen_dripping_from_pussy",
-      "bukkake",
-      "pre_ejaculate"
+      { "tag": "penis_in_mouth", "match_any": ["penis_in_mouth", "deepthroat"], "match_all": [] }
     ]
   }
-}
+]

@@ -128,6 +128,13 @@ internal static class Program {
     private enum TagBucket { Identity, FaceHairEyes, Outfit, PoseAction, Background, StyleQuality, Other }
     private sealed record ActionRule(string ParentTag, string[] RequiredAll, string[] RequiredAny, string[] ForbiddenAny, ActionSubtypeRule[] Subtypes);
     private sealed record ActionSubtypeRule(string Tag, string[] MatchAny, string[] MatchAll);
+    private sealed record FacetRule(string Tag, string[] MatchAny, string[] MatchAll);
+    private sealed record RequiredFacet(string Name, string DefaultTag, FacetRule[] Rules);
+    private sealed record LexiconConfig(Dictionary<string, string> Aliases, Dictionary<string, string[]> Implied);
+
+    private static LexiconConfig ActiveLexicon = BuildDefaultLexicon();
+    private static ActionRule[] ActiveActionRules = ActionInferenceRules;
+    private static RequiredFacet[] ActiveRequiredFacets = [];
 
     public static async Task<int> Main(string[] args) {
         try {
@@ -153,6 +160,7 @@ internal static class Program {
         LoadKnownTagDictionary(options);
         ActiveProfile = options.NoProfile ? null : LoadProfile(options.Profile, options);
         BuildForceAllowTags(options, ActiveProfile);
+        LoadRuleEngineConfigs(options.Dir);
 
         var minimalFallback = string.Join(", ", HardPrefixTags.Concat(SplitTags(options.MinimalSubjectTags)).Distinct(StringComparer.OrdinalIgnoreCase));
 
@@ -288,16 +296,24 @@ internal static class Program {
                 var finalTags = finalSelection.Tags;
                 if (finalTags.Count < 3)
                     finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
-                finalTags = InferActionTags(finalTags);
-                EnsureFootjobFrequencyCoverage(finalTags, 50);
-                if (HasTag(finalTags, "feet") && HasTag(finalTags, "penis")) {
+
+                var firedRules = new List<string>();
+                var evidenceTags = BuildEvidenceTags(finalCandidates);
+                ExpandImpliedTags(evidenceTags, ActiveLexicon);
+                var normalizedFinalSet = finalTags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                ExpandImpliedTags(normalizedFinalSet, ActiveLexicon);
+                finalTags = normalizedFinalSet.ToList();
+                finalTags = InferActionTags(finalTags, evidenceTags, firedRules);
+                EnsureRequiredFacets(finalTags, evidenceTags, firedRules);
+
+                if (HasTag(evidenceTags, "feet") && HasTag(evidenceTags, "penis")) {
                     Interlocked.Increment(ref actionEligibleCount);
                     if (HasTag(finalTags, "footjob")) Interlocked.Increment(ref actionFootjobCount);
                 }
 
                 var unknownFinalTags = GetUnknownTags(finalTags);
 
-                var line = FormatCaptionWithSections(finalTags);
+                var line = FormatCaptionSingleLine(finalTags);
                 await File.WriteAllTextAsync(txtPath, line + Environment.NewLine, new UTF8Encoding(false), ct);
 
                 bool isLow = MissingCoreBuckets(finalTags);
@@ -315,7 +331,7 @@ internal static class Program {
                     HandleReject(imagePath, txtPath, options, rejectReason!);
                 }
 
-                AppendAudit(options.Dir, Path.GetFileName(imagePath), finalTags, finalSelection.DroppedTagsWithReason, rejectReason, KnownTagDictionaryPath, options.NoProfile ? "none" : options.Profile, coverageStopReason, coverageTrace);
+                AppendAudit(options.Dir, Path.GetFileName(imagePath), finalTags, evidenceTags.ToList(), firedRules, finalSelection.DroppedTagsWithReason, rejectReason, KnownTagDictionaryPath, options.NoProfile ? "none" : options.Profile, coverageStopReason, coverageTrace);
 
                 if (review is not null) {
                     AppendReviewLog(options.Dir, review);
@@ -700,37 +716,62 @@ internal static class Program {
         _ => 3
     };
 
-    private static bool HasTag(IEnumerable<string> tags, string tag) => tags.Any(t => string.Equals(NormalizeTag(t), tag, StringComparison.OrdinalIgnoreCase));
+    private static bool HasTag(IEnumerable<string> tags, string tag) => tags.Any(t => string.Equals(NormalizeTag(t), NormalizeTag(tag), StringComparison.OrdinalIgnoreCase));
 
-    private static List<string> InferActionTags(List<string> tags) {
-        var inferred = tags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        var inferredSet = inferred.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    private static HashSet<string> BuildEvidenceTags(IEnumerable<TagCandidate> rawCandidates) {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in rawCandidates) {
+            if (c.Score < 0.28) continue;
+            var n = NormalizeTag(c.Tag);
+            if (!string.IsNullOrWhiteSpace(n)) set.Add(n);
+        }
+        return set;
+    }
 
-        foreach (var rule in ActionInferenceRules) {
-            if (!MatchesActionRule(inferredSet, rule)) continue;
+    private static List<string> InferActionTags(List<string> finalTags, HashSet<string> evidenceTags, List<string> firedRules) {
+        var inferred = finalTags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var finalSet = inferred.ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            if (inferredSet.Add(rule.ParentTag)) {
+        foreach (var rule in ActiveActionRules) {
+            if (!MatchesActionRule(evidenceTags, rule)) continue;
+
+            if (finalSet.Add(rule.ParentTag)) {
                 inferred.Add(rule.ParentTag);
             }
+            firedRules.Add($"action:{rule.ParentTag}");
 
             foreach (var subtype in rule.Subtypes) {
-                if (!MatchesSubtypeRule(inferredSet, subtype)) continue;
-                if (inferredSet.Add(subtype.Tag)) {
+                if (!MatchesSubtypeRule(evidenceTags, subtype)) continue;
+                if (finalSet.Add(subtype.Tag)) {
                     inferred.Add(subtype.Tag);
                 }
+                firedRules.Add($"subtype:{rule.ParentTag}:{subtype.Tag}");
             }
         }
 
         return inferred;
     }
 
-    private static void EnsureFootjobFrequencyCoverage(List<string> tags, int targetPercent = 50) {
-        if (targetPercent <= 0) return;
+    private static void EnsureRequiredFacets(List<string> finalTags, HashSet<string> evidenceTags, List<string> firedRules) {
+        if (ActiveRequiredFacets.Length == 0) return;
 
-        bool hasFeetAndPenis = HasTag(tags, "feet") && HasTag(tags, "penis");
-        if (!hasFeetAndPenis) return;
+        var finalSet = finalTags.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var facet in ActiveRequiredFacets) {
+            string selected = facet.DefaultTag;
+            foreach (var rule in facet.Rules) {
+                if (!MatchesFacetRule(evidenceTags, rule)) continue;
+                selected = rule.Tag;
+                firedRules.Add($"facet:{facet.Name}:{rule.Tag}");
+                break;
+            }
 
-        if (!HasTag(tags, "footjob")) tags.Add("footjob");
+            if (finalSet.Add(selected)) {
+                finalTags.Add(selected);
+            }
+            if (selected == facet.DefaultTag) {
+                firedRules.Add($"facet:{facet.Name}:{facet.DefaultTag}:default");
+            }
+        }
     }
 
     private static bool MatchesActionRule(HashSet<string> normalizedTags, ActionRule rule) {
@@ -743,6 +784,12 @@ internal static class Program {
     private static bool MatchesSubtypeRule(HashSet<string> normalizedTags, ActionSubtypeRule subtype) {
         if (subtype.MatchAny.Any() && !subtype.MatchAny.Any(normalizedTags.Contains)) return false;
         if (subtype.MatchAll.Any() && !subtype.MatchAll.All(normalizedTags.Contains)) return false;
+        return true;
+    }
+
+    private static bool MatchesFacetRule(HashSet<string> normalizedTags, FacetRule rule) {
+        if (rule.MatchAny.Any() && !rule.MatchAny.Any(normalizedTags.Contains)) return false;
+        if (rule.MatchAll.Any() && !rule.MatchAll.All(normalizedTags.Contains)) return false;
         return true;
     }
 
@@ -908,38 +955,22 @@ internal static class Program {
         File.WriteAllText(rejectTextPath, reason + Environment.NewLine, new UTF8Encoding(false));
     }
 
-    private static void AppendAudit(string datasetRoot, string filename, List<string> keptTags, List<string> droppedTagsWithReason, string? rejectReason, string? vocabFile, string usedProfile, string coverageStopReason, List<string> coverageTrace) {
+    private static void AppendAudit(string datasetRoot, string filename, List<string> keptTags, List<string> evidenceTags, List<string> firedRules, List<string> droppedTagsWithReason, string? rejectReason, string? vocabFile, string usedProfile, string coverageStopReason, List<string> coverageTrace) {
         var reviewDir = Path.Combine(datasetRoot, "__review");
         Directory.CreateDirectory(reviewDir);
         var path = Path.Combine(reviewDir, "audit.csv");
         lock (ReviewLogLock) {
             if (!File.Exists(path) || new FileInfo(path).Length == 0) {
-                File.AppendAllText(path, "filename,kept_tags,dropped_tags_with_reason,reject_reason,used_vocab_file,used_profile,coverage_stop_reason,coverage_trace" + Environment.NewLine, new UTF8Encoding(false));
+                File.AppendAllText(path, "filename,final_tags,evidence_tags,fired_rules,dropped_tags_with_reason,reject_reason,used_vocab_file,used_profile,coverage_stop_reason,coverage_trace" + Environment.NewLine, new UTF8Encoding(false));
             }
-            var line = string.Join(",", [Csv(filename), Csv(string.Join(";", keptTags)), Csv(string.Join(";", droppedTagsWithReason)), Csv(rejectReason ?? ""), Csv(vocabFile ?? ""), Csv(usedProfile), Csv(coverageStopReason), Csv(string.Join(";", coverageTrace))]);
+            var line = string.Join(",", [Csv(filename), Csv(string.Join(";", keptTags)), Csv(string.Join(";", evidenceTags)), Csv(string.Join(";", firedRules)), Csv(string.Join(";", droppedTagsWithReason)), Csv(rejectReason ?? ""), Csv(vocabFile ?? ""), Csv(usedProfile), Csv(coverageStopReason), Csv(string.Join(";", coverageTrace))]);
             File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
         }
     }
 
-    private static string FormatCaptionWithSections(List<string> finalTags) {
+    private static string FormatCaptionSingleLine(List<string> finalTags) {
         var normalized = finalTags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-
-        var actionTags = normalized.Where(t => ActionTags.Contains(t)).ToList();
-        var characterTags = normalized.Where(t => SubjectTokens.Contains(t) || IsLikelyCharacterName(t) || ClassifyTag(t) == TagBucket.FaceHairEyes).ToList();
-        var compositionTags = normalized.Except(characterTags, StringComparer.OrdinalIgnoreCase).Except(actionTags, StringComparer.OrdinalIgnoreCase).ToList();
-
-        if (actionTags.Count == 0) return string.Join(", ", normalized);
-
-        return string.Join(Environment.NewLine, new[] {
-            "# Character",
-            string.Join(", ", characterTags),
-            "",
-            "# Composition",
-            string.Join(", ", compositionTags),
-            "",
-            "# Actions",
-            string.Join(", ", actionTags)
-        });
+        return string.Join(", ", normalized);
     }
 
     private static string Csv(string s) {
@@ -1121,8 +1152,30 @@ internal static class Program {
         t = Regex.Replace(t, @"\s+", "_");
         t = Regex.Replace(t, @"_+", "_");
         t = t.ToLowerInvariant();
-        if (ActionTagAliases.TryGetValue(t, out var canonical)) return canonical;
+        if (ActiveLexicon.Aliases.TryGetValue(t, out var canonical)) return canonical;
+        if (ActionTagAliases.TryGetValue(t, out canonical)) return canonical;
         return t;
+    }
+
+    private static void ExpandImpliedTags(ISet<string> tags, LexiconConfig lex) {
+        bool changed;
+        do {
+            changed = false;
+            var snapshot = tags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            foreach (var tag in snapshot) {
+                if (!tags.Contains(tag)) {
+                    tags.Add(tag);
+                    changed = true;
+                }
+
+                if (lex.Implied.TryGetValue(tag, out var impliedList)) {
+                    foreach (var implied in impliedList.Select(NormalizeTag)) {
+                        if (string.IsNullOrWhiteSpace(implied)) continue;
+                        if (tags.Add(implied)) changed = true;
+                    }
+                }
+            }
+        } while (changed);
     }
 
     private static IEnumerable<string> SplitTags(string s) {
@@ -1154,6 +1207,215 @@ internal static class Program {
     private static string CutAfterPrefix(string text, string prefix) {
         var idx = text.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
         return idx >= 0 ? text[..idx].Trim() : text;
+    }
+
+    private static void LoadRuleEngineConfigs(string datasetRoot) {
+        ActiveLexicon = BuildDefaultLexicon();
+        ActiveActionRules = ActionInferenceRules;
+        ActiveRequiredFacets = BuildDefaultRequiredFacets();
+
+        var rulesDir = Path.Combine(datasetRoot, "rules");
+        if (!Directory.Exists(rulesDir)) {
+            rulesDir = Path.Combine(Directory.GetCurrentDirectory(), "rules");
+        }
+
+        LoadLexicon(Path.Combine(rulesDir, "lexicon.json"));
+        LoadActions(Path.Combine(rulesDir, "actions.json"));
+        LoadRequiredFacets(Path.Combine(rulesDir, "required_facets.json"));
+        RebuildActionTagSet();
+    }
+
+    private static LexiconConfig BuildDefaultLexicon() {
+        var aliases = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (k, v) in ActionTagAliases) aliases[NormalizeTagBasic(k)] = NormalizeTagBasic(v);
+
+        aliases["sole"] = "foot_sole";
+        aliases["soles"] = "foot_sole";
+        aliases["foot"] = "feet";
+        aliases["hands"] = "hand";
+        aliases["fingers"] = "hand";
+        aliases["licking"] = "oral";
+
+        var implied = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase) {
+            ["barefoot"] = ["feet"],
+            ["foot"] = ["feet"],
+            ["toes"] = ["feet"],
+            ["sole"] = ["feet"],
+            ["soles"] = ["feet"],
+            ["foot_sole"] = ["feet"],
+            ["hands"] = ["hand"],
+            ["fingers"] = ["hand"],
+            ["oral"] = ["mouth"],
+            ["licking"] = ["oral", "mouth"]
+        };
+
+        return new LexiconConfig(aliases, implied);
+    }
+
+    private static RequiredFacet[] BuildDefaultRequiredFacets() {
+        return [
+            new RequiredFacet("viewpoint", "unknown_pov", [new FacetRule("male_pov", ["male_pov", "pov_male", "from_male_pov"], []), new FacetRule("third_person", ["third_person", "third_person_view"], [])]),
+            new RequiredFacet("gaze", "unknown_gaze", [new FacetRule("looking_at_camera", ["looking_at_viewer", "looking_at_camera"], []), new FacetRule("looking_at_partner", ["looking_at_male", "looking_at_partner"], []), new FacetRule("looking_at_object", ["looking_at_penis", "looking_at_object"], [])]),
+            new RequiredFacet("underwear", "unknown_underwear", [new FacetRule("panties_aside", ["panties_aside"], []), new FacetRule("panties_off", ["panties_off", "no_panties"], []), new FacetRule("panties_on", ["panties_on", "wearing_panties"], [])]),
+            new RequiredFacet("fluids", "unknown_fluids", [new FacetRule("semen_present", ["semen", "cum"], []), new FacetRule("precum_present", ["pre_ejaculate", "precum"], []), new FacetRule("no_fluids", ["no_fluids"], [])]),
+            new RequiredFacet("ejaculation", "unknown_ejaculation", [new FacetRule("ejaculation", ["ejaculation", "cumshot"], []), new FacetRule("no_ejaculation", ["no_ejaculation"], [])]),
+            new RequiredFacet("expression", "unknown_expression", [new FacetRule("ahegao", ["ahegao"], []), new FacetRule("smile", ["smile", "smiling"], []), new FacetRule("neutral", ["neutral_expression"], [])]),
+            new RequiredFacet("mouth_shape", "unknown_mouth", [new FacetRule("tongue_out", ["tongue_out"], []), new FacetRule("mouth_open", ["open_mouth"], []), new FacetRule("mouth_closed", ["closed_mouth"], [])])
+        ];
+    }
+
+    private static string NormalizeTagBasic(string t) {
+        t = t.Trim().Trim('"', '\'', '`');
+        t = Regex.Replace(t, @"[;。、\.]+$", "");
+        t = Regex.Replace(t, @"\s+", "_");
+        t = Regex.Replace(t, @"_+", "_");
+        return t.ToLowerInvariant();
+    }
+
+    private static void LoadLexicon(string path) {
+        if (!File.Exists(path)) return;
+        using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+        var root = doc.RootElement;
+
+        var aliases = new Dictionary<string, string>(ActiveLexicon.Aliases, StringComparer.OrdinalIgnoreCase);
+        var implied = new Dictionary<string, string[]>(ActiveLexicon.Implied, StringComparer.OrdinalIgnoreCase);
+
+        if (root.TryGetProperty("aliases", out var aliasesEl) && aliasesEl.ValueKind == JsonValueKind.Object) {
+            foreach (var p in aliasesEl.EnumerateObject()) aliases[NormalizeTagBasic(p.Name)] = NormalizeTagBasic(p.Value.GetString() ?? "");
+        }
+        if (root.TryGetProperty("normalization", out var normEl) && normEl.ValueKind == JsonValueKind.Object) {
+            foreach (var p in normEl.EnumerateObject()) aliases[NormalizeTagBasic(p.Name)] = NormalizeTagBasic(p.Value.GetString() ?? "");
+        }
+        if (root.TryGetProperty("synonyms", out var synEl) && synEl.ValueKind == JsonValueKind.Object) {
+            foreach (var p in synEl.EnumerateObject()) {
+                if (p.Value.ValueKind != JsonValueKind.Array) continue;
+                var canonical = NormalizeTagBasic(p.Name);
+                foreach (var item in p.Value.EnumerateArray()) aliases[NormalizeTagBasic(item.GetString() ?? "")] = canonical;
+            }
+        }
+
+        if (root.TryGetProperty("implied", out var implEl) && implEl.ValueKind == JsonValueKind.Object) {
+            foreach (var p in implEl.EnumerateObject()) implied[NormalizeTagBasic(p.Name)] = ParseStringArray(p.Value);
+        }
+        if (root.TryGetProperty("implied_tags", out var implTagsEl) && implTagsEl.ValueKind == JsonValueKind.Object) {
+            foreach (var p in implTagsEl.EnumerateObject()) implied[NormalizeTagBasic(p.Name)] = ParseStringArray(p.Value);
+        }
+
+        ActiveLexicon = new LexiconConfig(aliases, implied);
+    }
+
+    private static void LoadActions(string path) {
+        if (!File.Exists(path)) return;
+        using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+        var root = doc.RootElement;
+        var list = new List<ActionRule>();
+
+        if (root.ValueKind == JsonValueKind.Array) {
+            foreach (var item in root.EnumerateArray()) {
+                var parsed = ParseActionRule(item);
+                if (parsed is not null) list.Add(parsed);
+            }
+        } else if (root.ValueKind == JsonValueKind.Object) {
+            bool hasRuleFields = root.TryGetProperty("parent_tag", out _) || root.TryGetProperty("parent", out _);
+            if (hasRuleFields) {
+                var parsed = ParseActionRule(root);
+                if (parsed is not null) list.Add(parsed);
+            } else {
+                foreach (var p in root.EnumerateObject()) {
+                    var category = p.Value;
+                    if (category.ValueKind != JsonValueKind.Object) continue;
+                    var parents = category.TryGetProperty("parent", out var parentEl) ? ParseStringArray(parentEl) : [];
+                    var subtypes = category.TryGetProperty("subtypes", out var subtypeEl) ? ParseStringArray(subtypeEl) : [];
+                    foreach (var parent in parents.Where(x => !string.IsNullOrWhiteSpace(x))) {
+                        var rule = new ActionRule(parent, [parent], [], [], subtypes.Select(st => new ActionSubtypeRule(st, [st], [])).ToArray());
+                        list.Add(rule);
+                    }
+                }
+            }
+        }
+
+        if (list.Count > 0) ActiveActionRules = list.ToArray();
+    }
+
+    private static ActionRule? ParseActionRule(JsonElement item) {
+        if (item.ValueKind != JsonValueKind.Object) return null;
+        var parent = item.TryGetProperty("parent_tag", out var pt) ? pt.GetString() : null;
+        if (string.IsNullOrWhiteSpace(parent) && item.TryGetProperty("parent", out var parentEl)) {
+            if (parentEl.ValueKind == JsonValueKind.String) parent = parentEl.GetString();
+            else if (parentEl.ValueKind == JsonValueKind.Array) parent = parentEl.EnumerateArray().Select(x => x.GetString()).FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
+        }
+        if (string.IsNullOrWhiteSpace(parent)) return null;
+
+        var requiredAll = item.TryGetProperty("required_all", out var allEl) ? ParseStringArray(allEl) : [];
+        var requiredAny = item.TryGetProperty("required_any", out var anyEl) ? ParseStringArray(anyEl) : [];
+        var forbiddenAny = item.TryGetProperty("forbidden_any", out var forbEl) ? ParseStringArray(forbEl) : [];
+        var subtypes = new List<ActionSubtypeRule>();
+
+        if (item.TryGetProperty("subtypes", out var subtypeEl)) {
+            if (subtypeEl.ValueKind == JsonValueKind.Array) {
+                foreach (var st in subtypeEl.EnumerateArray()) {
+                    if (st.ValueKind == JsonValueKind.String) {
+                        var tag = NormalizeTagBasic(st.GetString() ?? "");
+                        if (!string.IsNullOrWhiteSpace(tag)) subtypes.Add(new ActionSubtypeRule(tag, [tag], []));
+                    } else if (st.ValueKind == JsonValueKind.Object) {
+                        var tag = st.TryGetProperty("tag", out var tagEl) ? NormalizeTagBasic(tagEl.GetString() ?? "") : "";
+                        if (string.IsNullOrWhiteSpace(tag)) continue;
+                        var matchAny = st.TryGetProperty("match_any", out var mAnyEl) ? ParseStringArray(mAnyEl) : [];
+                        var matchAll = st.TryGetProperty("match_all", out var mAllEl) ? ParseStringArray(mAllEl) : [];
+                        subtypes.Add(new ActionSubtypeRule(tag, matchAny, matchAll));
+                    }
+                }
+            }
+        }
+
+        return new ActionRule(NormalizeTagBasic(parent), requiredAll, requiredAny, forbiddenAny, subtypes.ToArray());
+    }
+
+    private static void LoadRequiredFacets(string path) {
+        if (!File.Exists(path)) return;
+        using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+        var root = doc.RootElement;
+        var facets = new List<RequiredFacet>();
+
+        if (root.ValueKind != JsonValueKind.Object) return;
+        foreach (var p in root.EnumerateObject()) {
+            if (p.Value.ValueKind == JsonValueKind.Array) {
+                var tags = ParseStringArray(p.Value);
+                if (tags.Length == 0) continue;
+                var defaultTag = tags.FirstOrDefault(t => t.StartsWith("unknown_", StringComparison.OrdinalIgnoreCase)) ?? $"unknown_{NormalizeTagBasic(p.Name)}";
+                var rules = tags.Where(t => !t.StartsWith("unknown_", StringComparison.OrdinalIgnoreCase)).Select(t => new FacetRule(t, [t], [])).ToArray();
+                facets.Add(new RequiredFacet(NormalizeTagBasic(p.Name), defaultTag, rules));
+            } else if (p.Value.ValueKind == JsonValueKind.Object) {
+                var defaultTag = p.Value.TryGetProperty("default", out var defEl) ? NormalizeTagBasic(defEl.GetString() ?? "") : $"unknown_{NormalizeTagBasic(p.Name)}";
+                var rules = new List<FacetRule>();
+                if (p.Value.TryGetProperty("rules", out var rulesEl) && rulesEl.ValueKind == JsonValueKind.Array) {
+                    foreach (var r in rulesEl.EnumerateArray()) {
+                        if (r.ValueKind != JsonValueKind.Object) continue;
+                        var tag = r.TryGetProperty("tag", out var tagEl) ? NormalizeTagBasic(tagEl.GetString() ?? "") : "";
+                        if (string.IsNullOrWhiteSpace(tag)) continue;
+                        var any = r.TryGetProperty("match_any", out var anyEl) ? ParseStringArray(anyEl) : [];
+                        var all = r.TryGetProperty("match_all", out var allEl) ? ParseStringArray(allEl) : [];
+                        rules.Add(new FacetRule(tag, any, all));
+                    }
+                }
+                facets.Add(new RequiredFacet(NormalizeTagBasic(p.Name), defaultTag, rules.ToArray()));
+            }
+        }
+
+        if (facets.Count > 0) ActiveRequiredFacets = facets.ToArray();
+    }
+
+    private static string[] ParseStringArray(JsonElement el) {
+        if (el.ValueKind == JsonValueKind.String) return [NormalizeTagBasic(el.GetString() ?? "")].Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
+        if (el.ValueKind != JsonValueKind.Array) return [];
+        return el.EnumerateArray().Select(x => NormalizeTagBasic(x.GetString() ?? "")).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static void RebuildActionTagSet() {
+        foreach (var rule in ActiveActionRules) {
+            ActionTags.Add(rule.ParentTag);
+            foreach (var st in rule.Subtypes) ActionTags.Add(st.Tag);
+        }
     }
 
     private static void LoadAllowDenyLists() {
@@ -1698,17 +1960,17 @@ internal static class Program {
         bool maxQualityRespected = tags.Count(t => ClassifyTag(t) == TagBucket.StyleQuality) <= MaxStyleTagCap;
         bool denyDropped = !tags.Contains("watermark");
 
-        var inferred = InferActionTags(new List<string> { "1girl", "feet", "penis" });
+        var inferred = InferActionTags(new List<string> { "1girl", "feet", "penis" }, new HashSet<string>(new[] { "1girl", "feet", "penis" }, StringComparer.OrdinalIgnoreCase), new List<string>());
         bool actionInferenceParentOnlyWorks = inferred.Contains("footjob") && !inferred.Contains("penis_between_feet");
-        var footSubtype = InferActionTags(new List<string> { "1girl", "feet", "penis", "between_feet" });
+        var footSubtype = InferActionTags(new List<string> { "1girl", "feet", "penis", "between_feet" }, new HashSet<string>(new[] { "1girl", "feet", "penis", "between_feet" }, StringComparer.OrdinalIgnoreCase), new List<string>());
         bool footSubtypeWorks = footSubtype.Contains("penis_between_feet");
-        var handjobInference = InferActionTags(new List<string> { "1girl", "penis", "hand", "grip" });
+        var handjobInference = InferActionTags(new List<string> { "1girl", "penis", "hand", "grip" }, new HashSet<string>(new[] { "1girl", "penis", "hand", "grip" }, StringComparer.OrdinalIgnoreCase), new List<string>());
         bool handjobWorks = handjobInference.Contains("handjob") && handjobInference.Contains("hand_wrapping_penis");
-        var sexInference = InferActionTags(new List<string> { "1girl", "penis", "vaginal_penetration", "missionary" });
+        var sexInference = InferActionTags(new List<string> { "1girl", "penis", "vaginal_penetration", "missionary" }, new HashSet<string>(new[] { "1girl", "penis", "vaginal_penetration", "missionary" }, StringComparer.OrdinalIgnoreCase), new List<string>());
         bool sexWorks = sexInference.Contains("sex") && sexInference.Contains("missionary");
         bool aliasNormalized = NormalizeTag("pedal stimulation") == "footjob";
-        var sectioned = FormatCaptionWithSections(inferred);
-        bool sectionOutputWorks = sectioned.Contains("# Actions", StringComparison.Ordinal) && sectioned.Contains("footjob", StringComparison.Ordinal);
+        var sectioned = FormatCaptionSingleLine(inferred);
+        bool sectionOutputWorks = !sectioned.Contains("# Actions", StringComparison.Ordinal) && sectioned.Contains("footjob", StringComparison.Ordinal);
 
         bool noLegacyLiteralsInProgram = RunStaticStringChecks();
 

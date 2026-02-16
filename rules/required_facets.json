@@ -1,44 +1,56 @@
 {
-  "viewpoint": [
-    "pov_male",
-    "third_person_view"
-  ],
-
-  "gaze_target": [
-    "looking_at_male",
-    "looking_at_penis",
-    "looking_at_viewer"
-  ],
-
-  "eye_state": [
-    "eye_half_open",
-    "smiling",
-    "flushed_face"
-  ],
-
-  "mouth_state": [
-    "open_mouth",
-    "tongue_out",
-    "mouth_on_penis"
-  ],
-
-  "underwear_state": [
-    "panties_on",
-    "panties_off",
-    "pants_on"
-  ],
-
-  "fluid_state": [
-    "no_fluids",
-    "pre_ejaculate",
-    "semen",
-    "semen_dripping_from_pussy"
-  ],
-
-  "contact_state": [
-    "hands_on_penis",
-    "mouth_on_penis",
-    "feet_on_penis",
-    "no_direct_contact"
-  ]
+  "viewpoint": {
+    "default": "unknown_pov",
+    "rules": [
+      { "tag": "male_pov", "match_any": ["male_pov", "pov_male", "from_male_pov"], "match_all": [] },
+      { "tag": "third_person", "match_any": ["third_person", "third_person_view"], "match_all": [] }
+    ]
+  },
+  "gaze": {
+    "default": "unknown_gaze",
+    "rules": [
+      { "tag": "looking_at_camera", "match_any": ["looking_at_camera", "looking_at_viewer"], "match_all": [] },
+      { "tag": "looking_at_partner", "match_any": ["looking_at_partner", "looking_at_male"], "match_all": [] },
+      { "tag": "looking_at_object", "match_any": ["looking_at_penis", "looking_at_object"], "match_all": [] }
+    ]
+  },
+  "underwear": {
+    "default": "unknown_underwear",
+    "rules": [
+      { "tag": "panties_aside", "match_any": ["panties_aside"], "match_all": [] },
+      { "tag": "panties_off", "match_any": ["panties_off", "no_panties"], "match_all": [] },
+      { "tag": "panties_on", "match_any": ["panties_on", "wearing_panties"], "match_all": [] }
+    ]
+  },
+  "fluids": {
+    "default": "unknown_fluids",
+    "rules": [
+      { "tag": "semen_present", "match_any": ["semen", "cum"], "match_all": [] },
+      { "tag": "precum_present", "match_any": ["pre_ejaculate", "precum"], "match_all": [] },
+      { "tag": "no_fluids", "match_any": ["no_fluids"], "match_all": [] }
+    ]
+  },
+  "ejaculation": {
+    "default": "unknown_ejaculation",
+    "rules": [
+      { "tag": "ejaculation", "match_any": ["ejaculation", "cumshot"], "match_all": [] },
+      { "tag": "no_ejaculation", "match_any": ["no_ejaculation"], "match_all": [] }
+    ]
+  },
+  "expression": {
+    "default": "unknown_expression",
+    "rules": [
+      { "tag": "ahegao", "match_any": ["ahegao"], "match_all": [] },
+      { "tag": "smile", "match_any": ["smile", "smiling"], "match_all": [] },
+      { "tag": "neutral", "match_any": ["neutral_expression"], "match_all": [] }
+    ]
+  },
+  "mouth_shape": {
+    "default": "unknown_mouth",
+    "rules": [
+      { "tag": "tongue_out", "match_any": ["tongue_out"], "match_all": [] },
+      { "tag": "mouth_open", "match_any": ["open_mouth"], "match_all": [] },
+      { "tag": "mouth_closed", "match_any": ["closed_mouth"], "match_all": [] }
+    ]
+  }
 }
