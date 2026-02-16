@@ -1406,7 +1406,10 @@ internal static class Program {
     }
 
     private static string[] ParseStringArray(JsonElement el) {
-        if (el.ValueKind == JsonValueKind.String) return [NormalizeTagBasic(el.GetString() ?? "")].Where(t => !string.IsNullOrWhiteSpace(t)).ToArray();
+        if (el.ValueKind == JsonValueKind.String) {
+            var s = NormalizeTagBasic(el.GetString() ?? "");
+            return string.IsNullOrWhiteSpace(s) ? Array.Empty<string>() : new[] { s };
+        }
         if (el.ValueKind != JsonValueKind.Array) return [];
         return el.EnumerateArray().Select(x => NormalizeTagBasic(x.GetString() ?? "")).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     }
