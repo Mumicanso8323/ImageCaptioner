@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set TARGET=D:\ai\kohya_ss\dataset\images 2\1_shigure_ui
+set TARGET=D:\ai\kohya_ss\dataset\images 2\1_sgrui
 
 echo ===============================
 echo  TXT / NEEDTAG ˆêŠ‡íœ
