@@ -2,32 +2,37 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 rem =========================================================
-rem  即閉じ対策：自分を cmd /k で再起動してウィンドウを保持する
-rem  ログ：同じフォルダに clean_txt_last.log
+rem  clean_txt.bat
+rem  - .txt / .needtag を削除
+rem  - ログは ./log にタイムスタンプ付きで蓄積
 rem =========================================================
 
-rem --- "内側起動" でなければ cmd /k で自分を call して再起動 ---
-if /I not "%~1"=="--inner" (
-  set "SELF=%~f0"
-  set "LOG=%~dp0clean_txt_last.log"
-  (echo ==== START %DATE% %TIME% ====)> "%LOG%"
+set "SCRIPT_DIR=%~dp0"
+set "LOG_DIR=%SCRIPT_DIR%log"
+if not exist "%LOG_DIR%\" mkdir "%LOG_DIR%" >nul 2>&1
 
-  rem ★ここが重要：cmd /k の中で call "%SELF%" する（クォート崩れ防止）
-  start "clean_txt" cmd /k call "%SELF%" --inner %*
-  exit /b
-)
+set "STAMP="
+for /f %%I in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss" 2^>nul') do set "STAMP=%%I"
+if not defined STAMP set "STAMP=%DATE: =0%_%TIME: =0%"
+set "STAMP=%STAMP::=%"
+set "STAMP=%STAMP:/=%"
+set "STAMP=%STAMP:.=%"
 
-shift
+set "LOG_FILE=%LOG_DIR%\clean_txt_%STAMP%.log"
 
-rem --- ここから本処理（ログへリダイレクト） ---
-call :main %* 1>>"%~dp0clean_txt_last.log" 2>>&1
+echo [info] log file: "%LOG_FILE%"
+call :main %* 1>"%LOG_FILE%" 2>&1
+set "EXIT_CODE=%ERRORLEVEL%"
+
 echo.
-echo (log) "%~dp0clean_txt_last.log"
+echo [info] 実行ログ: "%LOG_FILE%"
+if not "%EXIT_CODE%"=="0" echo [error] clean_txt.bat は異常終了しました (exit code: %EXIT_CODE%)
 echo.
 pause
-exit /b
+exit /b %EXIT_CODE%
 
 :main
+echo ==== START %DATE% %TIME% ====
 echo Target cleanup tool
 echo.
 
@@ -98,4 +103,5 @@ for /f "delims=" %%F in ('dir /a:-d /s /b "%TARGET_DIR%\*.needtag" 2^>nul') do (
 )
 
 echo Done.
+echo ==== END %DATE% %TIME% ====
 exit /b 0
