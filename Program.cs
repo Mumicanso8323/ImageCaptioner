@@ -798,8 +798,10 @@ internal static class Program {
     }
 
     private static string Csv(string s) {
-        var escaped = s.Replace(""", """");
-        return $""{escaped}"";
+        if (s == null) return "";
+
+        var escaped = s.Replace("\"", "\"\"");
+        return $"\"{escaped}\"";
     }
 
     private static void LoadKnownTagDictionary(AppOptions options) {
