@@ -725,30 +725,53 @@ internal static class Program {
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
-        for (int i = 0; i < 180; i++) {
-            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) return (0, process);
+        var startupTimeout = TimeSpan.FromSeconds(180);
+        var startupWatch = Stopwatch.StartNew();
+        var isDetachedWait = false;
+        var nextDetachedStatus = TimeSpan.Zero;
 
-            if (process.HasExited) {
-                if (process.ExitCode == 0) {
-                    Console.WriteLine("[info] JoyTag launcher process exited with code 0. Waiting briefly for detached server startup...");
-                    for (int detachedWait = 0; detachedWait < 20; detachedWait++) {
-                        if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
-                            Console.WriteLine("[info] JoyTag became reachable after launcher exit. Continuing with existing server.");
-                            return (0, null);
-                        }
-                        await Task.Delay(500);
-                    }
+        while (startupWatch.Elapsed < startupTimeout) {
+            var elapsedSeconds = (int)startupWatch.Elapsed.TotalSeconds;
+            var isPortListening = TryGetLocalPort(options.JoyUrl, out var joyPortForListen) && IsPortListening(joyPortForListen);
+
+            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+                if (isDetachedWait) {
+                    Console.WriteLine("[info] JoyTag became reachable after launcher exit. Continuing with existing server.");
+                    return (0, null);
                 }
+                return (0, process);
+            }
 
-                Console.Error.WriteLine($"[error] JoyTag process exited before ready. exit={process.ExitCode}");
-                PrintRecentJoyTagLogs(stdoutLog, stderrLog);
-                return (2, null);
+            if (process is not null && process.HasExited) {
+                var exitCode = process.ExitCode;
+                if (exitCode == 0) {
+                    Console.WriteLine("[info] JoyTag launcher process exited with code 0. Waiting for detached server startup...");
+                    process = null;
+                    isDetachedWait = true;
+                    nextDetachedStatus = TimeSpan.FromSeconds(Math.Max(5, elapsedSeconds + 5));
+                } else {
+                    Console.Error.WriteLine($"[error] JoyTag process exited before ready. exit={exitCode}");
+                    if (isPortListening) {
+                        Console.Error.WriteLine("[info] JoyTag URL port is LISTENING, but HTTP health check still fails. Check JoyTag bind host and local firewall settings.");
+                    }
+                    PrintRecentJoyTagLogs(stdoutLog, stderrLog);
+                    return (2, null);
+                }
+            }
+
+            if (isDetachedWait && startupWatch.Elapsed >= nextDetachedStatus) {
+                Console.WriteLine($"[info] Waiting for JoyTag server to become reachable... (elapsed {elapsedSeconds}s)");
+                nextDetachedStatus += TimeSpan.FromSeconds(5);
             }
 
             await Task.Delay(1000);
         }
 
+        var timedOutPortListening = TryGetLocalPort(options.JoyUrl, out var timeoutPort) && IsPortListening(timeoutPort);
         Console.Error.WriteLine("[error] JoyTag did not become ready in time.");
+        if (timedOutPortListening) {
+            Console.Error.WriteLine("[info] JoyTag URL port is LISTENING, but HTTP health check still fails. Check JoyTag bind host and local firewall settings.");
+        }
         PrintRecentJoyTagLogs(stdoutLog, stderrLog);
         return (2, null);
     }
@@ -800,6 +823,8 @@ internal static class Program {
             try { listener?.Stop(); } catch { }
         }
     }
+
+    private static bool IsPortListening(int port) => GetListeningProcessIds(port).Any();
 
     private static bool TryFindAvailablePort(int startPort, out int foundPort) {
         for (int p = Math.Max(1024, startPort); p <= 65535; p++) {
