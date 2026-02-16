@@ -1,6 +1,9 @@
 @echo off
 setlocal
 
+rem Usage: run_last.bat "D:\path\to\dataset" (optional)
+
+
 set "EXE=ImageCaptioner.exe"
 
 if "%~1"=="" (
