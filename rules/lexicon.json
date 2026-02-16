@@ -1,0 +1,43 @@
+{
+  "normalization": {
+    "paizuri": "breast_job",
+    "breastjob": "breast_job",
+    "titjob": "breast_job",
+    "foot_job": "footjob",
+    "cum": "semen",
+    "cumshot": "ejaculation",
+    "precum": "pre_ejaculate",
+    "m_spread_cowgirl": "m_spread",
+    "smothering_cowgirl": "cowgirl",
+    "deepthroat_from_above": "blowjob"
+  },
+
+  "implied_tags": {
+    "breast_job": ["breasts"],
+    "blowjob": ["mouth_on_penis"],
+    "deepthroat_from_above": ["blowjob"],
+    "footjob": ["feet_on_penis"],
+    "thigh_job": ["thighs"],
+    "cunnilingus": ["mouth_on_pussy"],
+    "forced_cunnilingus": ["cunnilingus"],
+    "anal_licking": ["tongue", "anus"],
+    "glans_focus": ["penis"],
+    "glans_grab": ["penis"],
+    "foreskin_pull": ["penis"],
+    "bukkake": ["semen"],
+    "ejaculation": ["semen"],
+    "partial_penetration": ["penetration"],
+    "full_penetration": ["penetration"],
+    "smothering": ["face_sitting"]
+  },
+
+  "synonyms": {
+    "penis_kiss": ["kissing_penis"],
+    "penis_grab": ["holding_penis"],
+    "strong_grip_on_penis": ["tight_grip"],
+    "glans_teasing": ["tip_tease"],
+    "pants_on": ["clothed"],
+    "panties_on": ["wearing_panties"],
+    "panties_off": ["no_panties"]
+  }
+}

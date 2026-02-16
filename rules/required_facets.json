@@ -1,0 +1,44 @@
+{
+  "viewpoint": [
+    "pov_male",
+    "third_person_view"
+  ],
+
+  "gaze_target": [
+    "looking_at_male",
+    "looking_at_penis",
+    "looking_at_viewer"
+  ],
+
+  "eye_state": [
+    "eye_half_open",
+    "smiling",
+    "flushed_face"
+  ],
+
+  "mouth_state": [
+    "open_mouth",
+    "tongue_out",
+    "mouth_on_penis"
+  ],
+
+  "underwear_state": [
+    "panties_on",
+    "panties_off",
+    "pants_on"
+  ],
+
+  "fluid_state": [
+    "no_fluids",
+    "pre_ejaculate",
+    "semen",
+    "semen_dripping_from_pussy"
+  ],
+
+  "contact_state": [
+    "hands_on_penis",
+    "mouth_on_penis",
+    "feet_on_penis",
+    "no_direct_contact"
+  ]
+}

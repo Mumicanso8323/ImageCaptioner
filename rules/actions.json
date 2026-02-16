@@ -1,0 +1,69 @@
+{
+  "oral": {
+    "parent": ["blowjob", "cunnilingus", "anal_licking"],
+    "subtypes": [
+      "deepthroat_from_above",
+      "forced_cunnilingus",
+      "penis_kiss",
+      "tongue_on_foreskin",
+      "nipple_licking",
+      "nipple_licking_on_penis"
+    ]
+  },
+
+  "manual": {
+    "parent": ["handjob"],
+    "subtypes": [
+      "fast_handjob",
+      "one_hand_handjob",
+      "two_hand_handjob",
+      "prone_handjob",
+      "strong_grip_on_penis",
+      "glans_grab",
+      "palm_over_glans"
+    ]
+  },
+
+  "breast": {
+    "parent": ["breast_job"],
+    "subtypes": [
+      "lying_paizuri",
+      "pressing_paizuri",
+      "overbreast_paizuri",
+      "paizuri_under_clothes"
+    ]
+  },
+
+  "leg_based": {
+    "parent": ["thigh_job", "footjob"],
+    "subtypes": [
+      "lying_thigh_job",
+      "diamond_leg_lock",
+      "thigh_scissor_hold",
+      "knee_lock",
+      "penis_between_feet",
+      "footjob_while_trampling"
+    ]
+  },
+
+  "penetration": {
+    "parent": ["cowgirl"],
+    "subtypes": [
+      "m_spread",
+      "m_spread_on_all_fours",
+      "smothering_cowgirl",
+      "partial_penetration",
+      "full_penetration",
+      "thrusting"
+    ]
+  },
+
+  "fluid_events": {
+    "parent": ["ejaculation"],
+    "subtypes": [
+      "semen_dripping_from_pussy",
+      "bukkake",
+      "pre_ejaculate"
+    ]
+  }
+}
