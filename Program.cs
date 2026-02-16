@@ -692,10 +692,20 @@ internal static class Program {
             }
         }
 
+        var joyTagEntryScript = ResolveJoyTagEntryScript(options.JoyTagWorkingDir);
+        if (joyTagEntryScript is null) {
+            Console.Error.WriteLine("[error] JoyTag entry script not found in --joytag-dir.");
+            Console.Error.WriteLine("        expected one of: joytag_server.py, app.py, joytag_cli.py");
+            Console.Error.WriteLine($"        dir: {options.JoyTagWorkingDir}");
+            return (2, null);
+        }
+
+        Console.WriteLine($"[info] Starting JoyTag with {joyTagEntryScript}");
+
         var psi = new ProcessStartInfo {
             FileName = options.JoyTagPythonExe,
             WorkingDirectory = options.JoyTagWorkingDir,
-            Arguments = "app.py",
+            Arguments = joyTagEntryScript,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -728,6 +738,16 @@ internal static class Program {
         Console.Error.WriteLine("[error] JoyTag did not become ready in time.");
         PrintRecentJoyTagLogs(stdoutLog, stderrLog);
         return (2, null);
+    }
+
+    private static string? ResolveJoyTagEntryScript(string joyTagWorkingDir) {
+        var candidates = new[] { "joytag_server.py", "app.py", "joytag_cli.py" };
+        foreach (var candidate in candidates) {
+            var candidatePath = Path.Combine(joyTagWorkingDir, candidate);
+            if (File.Exists(candidatePath)) return candidate;
+        }
+
+        return null;
     }
 
     private static void EnqueueLog(ConcurrentQueue<string> queue, string line) {
