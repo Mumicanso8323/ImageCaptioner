@@ -39,20 +39,21 @@ internal static class Program {
     private enum TagBucket { Identity, FaceHairEyes, Outfit, PoseAction, Background, StyleQuality, Other }
 
     public static async Task<int> Main(string[] args) {
-        if (args.Contains("--help") || args.Contains("-h")) {
-            PrintHelp();
-            return 0;
-        }
+        try {
+            if (args.Contains("--help") || args.Contains("-h")) {
+                PrintHelp();
+                return 0;
+            }
 
-        if (args.Contains("--self-check")) {
-            var ok = RunSelfChecks();
-            Console.WriteLine(ok ? "Self-check passed." : "Self-check failed.");
-            return ok ? 0 : 1;
-        }
+            if (args.Contains("--self-check")) {
+                var ok = RunSelfChecks();
+                Console.WriteLine(ok ? "Self-check passed." : "Self-check failed.");
+                return ExitWithErrorPause(ok ? 0 : 1);
+            }
 
-        var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith("-", StringComparison.Ordinal));
-        var options = launchWizard ? RunWizard() : ParseOptions(args);
-        if (options is null) return 2;
+            var launchWizard = args.Length == 0 || args.Contains("--wizard") || (args.Length > 0 && args[0].StartsWith("-", StringComparison.Ordinal));
+            var options = launchWizard ? RunWizard() : ParseOptions(args);
+            if (options is null) return ExitWithErrorPause(2);
 
         HardPrefixTags = SplitTags(options.AutoPrefixTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         LoadAllowDenyLists();
@@ -66,27 +67,27 @@ internal static class Program {
             Console.WriteLine($"OpenAI={(string.IsNullOrWhiteSpace(options.ApiKey) ? "OFF" : "ON")} Model={options.OpenAiModel} DisableOpenAI={options.DisableOpenAi}");
         }
 
-        Process? autoStartedJoyTagProcess = null;
-        if (options.AutoStartJoyTag) {
-            var start = await StartOrReuseJoyTagServerAsync(options);
-            if (start.ExitCode != 0) return start.ExitCode;
-            autoStartedJoyTagProcess = start.AutoStartedProcess;
-            if (autoStartedJoyTagProcess is not null) RegisterJoyTagShutdownHandlers(autoStartedJoyTagProcess);
-        }
+            Process? autoStartedJoyTagProcess = null;
+            if (options.AutoStartJoyTag) {
+                var start = await StartOrReuseJoyTagServerAsync(options);
+                if (start.ExitCode != 0) return ExitWithErrorPause(start.ExitCode);
+                autoStartedJoyTagProcess = start.AutoStartedProcess;
+                if (autoStartedJoyTagProcess is not null) RegisterJoyTagShutdownHandlers(autoStartedJoyTagProcess);
+            }
 
-        using var httpJoy = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
-        using var httpOpenAI = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
-        if (!string.IsNullOrWhiteSpace(options.ApiKey))
-            httpOpenAI.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.ApiKey);
+            using var httpJoy = new HttpClient { Timeout = TimeSpan.FromSeconds(120) };
+            using var httpOpenAI = new HttpClient { Timeout = TimeSpan.FromSeconds(180) };
+            if (!string.IsNullOrWhiteSpace(options.ApiKey))
+                httpOpenAI.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", options.ApiKey);
 
-        var scanOpt = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
-        var images = Directory.EnumerateFiles(options.Dir, "*.*", scanOpt)
-            .Where(p => ImageExts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
-            .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-            .ToList();
+            var scanOpt = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            var images = Directory.EnumerateFiles(options.Dir, "*.*", scanOpt)
+                .Where(p => ImageExts.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-        int okCount = 0, skipped = 0, repaired = 0, low = 0, failed = 0;
-        var errors = new ConcurrentBag<string>();
+            int okCount = 0, skipped = 0, repaired = 0, low = 0, failed = 0;
+            var errors = new ConcurrentBag<string>();
         var po = new ParallelOptions { MaxDegreeOfParallelism = options.Concurrency };
 
         await Parallel.ForEachAsync(images, po, async (imagePath, ct) => {
@@ -156,14 +157,32 @@ internal static class Program {
             }
         });
 
-        Console.WriteLine($"Done. ok={okCount}, repaired={repaired}, skipped={skipped}, low={low}, failed={failed}");
-        if (!errors.IsEmpty) {
-            Console.WriteLine("---- Errors (summary) ----");
-            foreach (var e in errors.Take(20)) Console.WriteLine(e);
-            if (errors.Count > 20) Console.WriteLine($"(and {errors.Count - 20} more)");
-        }
+            Console.WriteLine($"Done. ok={okCount}, repaired={repaired}, skipped={skipped}, low={low}, failed={failed}");
+            if (!errors.IsEmpty) {
+                Console.WriteLine("---- Errors (summary) ----");
+                foreach (var e in errors.Take(20)) Console.WriteLine(e);
+                if (errors.Count > 20) Console.WriteLine($"(and {errors.Count - 20} more)");
+            }
 
-        return failed == 0 ? 0 : 1;
+            return ExitWithErrorPause(failed == 0 ? 0 : 1);
+        } catch (Exception ex) {
+            Console.Error.WriteLine("Fatal error occurred.");
+            Console.Error.WriteLine(ex.ToString());
+            return ExitWithErrorPause(1);
+        }
+    }
+
+    private static int ExitWithErrorPause(int exitCode) {
+        if (exitCode == 0) return 0;
+        PauseForError();
+        return exitCode;
+    }
+
+    private static void PauseForError() {
+        if (!Environment.UserInteractive) return;
+        Console.WriteLine();
+        Console.WriteLine("エラーで終了しました。Enterキーで終了します...");
+        Console.ReadLine();
     }
 
     private sealed class TagCandidate {
