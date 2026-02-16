@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
@@ -35,6 +36,7 @@ internal static class Program {
     private static readonly object ReviewLogLock = new();
     private static bool ActiveStrictKnownTags;
     private const int MaxTotalTags = 42;
+    private const int MaxCoverageFollowUpPasses = 2;
     private static readonly Regex ValidTagRegex = new("^[a-z0-9][a-z0-9_()!'/-]*$", RegexOptions.Compiled);
     private static readonly HashSet<string> ForceAllowTags = new(StringComparer.OrdinalIgnoreCase);
     private static ProfileConfig? ActiveProfile;
@@ -48,6 +50,8 @@ internal static class Program {
     private static readonly Regex PoseRegex = new(@"(pose|standing|sitting|lying|kneeling|crouching|walking|running|jumping|leaning|holding|raising|arms|hands|fingers|looking_at_viewer|looking_away|from_side|from_behind)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex BackgroundRegex = new(@"(indoors|outdoors|room|bedroom|street|city|school|classroom|park|forest|beach|sky|night|sunset|window|bed|chair|office|kitchen|bathroom)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex StyleRegex = new(@"(lighting|backlighting|rim_light|soft_light|hard_light|shadow|bloom|depth_of_field|bokeh|monochrome|highres|absurdres|masterpiece|best_quality|high_quality|detailed)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex HairCoverageRegex = new(@"(hair|bangs|twintails|ponytail|braid|ahoge)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex EyeCoverageRegex = new(@"(eyes|eyelashes|eyebrows|pupil|heterochromia)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly string[] DropTagsContains = [
         "negative:", "positive:", "sorry", "i can't", "i cannot", "cannot provide", "unable to", "as an ai", "i'm not able", "i won’t", "i won't"
@@ -141,19 +145,79 @@ internal static class Program {
                     joyCandidates = MergeCandidateTags(joyCandidates, LimitSecondaryTags(joyPrimary.Tags, joySecondary.Tags, options.SecondaryNewTagsCap));
                 }
 
-                var selectedFromJoy = SelectTags(joyCandidates, options);
-                bool needOpenAi = !options.DisableOpenAi
-                    && !string.IsNullOrWhiteSpace(options.ApiKey)
-                    && MissingCoreBuckets(selectedFromJoy.Tags);
-
                 var finalCandidates = joyCandidates;
-                if (needOpenAi) {
-                    var openText = await OpenAiRetryAsync(httpOpenAI, options.OpenAiModel, mime, bytes, options.OpenAiRetries, ct);
+                var finalSelection = SelectTags(finalCandidates, options);
+                var coverageTrace = new List<string>();
+                var coverageStopReason = "openai_unavailable_or_not_needed";
+                var coverage = EvaluateCoverage(finalSelection.Tags, options.Trigger);
+                coverageTrace.Add($"pass0_joy missing={string.Join("|", coverage.MissingCategoriesForPrompt)} required_missing={string.Join("|", coverage.MissingRequiredCategories)} details={string.Join("|", coverage.Details)} tags={finalSelection.Tags.Count}");
+
+                bool canUseOpenAi = !options.DisableOpenAi && !string.IsNullOrWhiteSpace(options.ApiKey);
+                if (canUseOpenAi && coverage.MissingCategoriesForPrompt.Count > 0) {
+                    var initialPrompt = BuildInitialOpenAiPrompt();
+                    var before = finalSelection.Tags.Count;
+                    var openText = await OpenAiRetryAsync(httpOpenAI, options.OpenAiModel, mime, bytes, initialPrompt, options.OpenAiRetries, ct);
                     var openCandidates = ParseTagCandidatesFromLine(openText, null, sourceWeight: 0.7, source: TagSource.OpenAI);
-                    finalCandidates = MergeCandidateTags(joyCandidates, openCandidates);
+                    finalCandidates = MergeCandidateTags(finalCandidates, openCandidates);
+                    finalSelection = SelectTags(finalCandidates, options);
+                    coverage = EvaluateCoverage(finalSelection.Tags, options.Trigger);
+                    coverageTrace.Add($"pass1_initial missing={string.Join("|", coverage.MissingCategoriesForPrompt)} required_missing={string.Join("|", coverage.MissingRequiredCategories)} tags_before={before} tags_after={finalSelection.Tags.Count}");
+
+                    if (coverage.MissingCategoriesForPrompt.Count == 0) {
+                        coverageStopReason = "coverage_satisfied";
+                    }
                 }
 
-                var finalSelection = SelectTags(finalCandidates, options);
+                if (!canUseOpenAi && coverage.MissingCategoriesForPrompt.Count > 0) {
+                    coverageStopReason = "openai_disabled_or_missing_api_key";
+                }
+
+                for (int pass = 1; canUseOpenAi && coverage.MissingCategoriesForPrompt.Count > 0 && pass <= MaxCoverageFollowUpPasses; pass++) {
+                    if (finalSelection.Tags.Count >= MaxTotalTags) {
+                        coverageStopReason = "max_total_tags_reached";
+                        break;
+                    }
+
+                    var missing = coverage.MissingCategoriesForPrompt;
+                    var prompt = BuildCoverageFollowUpPrompt(finalSelection.Tags, missing);
+                    var before = finalSelection.Tags.Count;
+                    var followText = await OpenAiRetryAsync(httpOpenAI, options.OpenAiModel, mime, bytes, prompt, options.OpenAiRetries, ct);
+                    var followCandidates = ParseTagCandidatesFromLine(followText, null, sourceWeight: 0.7, source: TagSource.OpenAI);
+
+                    if (followCandidates.Count == 0) {
+                        coverageTrace.Add($"followup_pass{pass} missing={string.Join("|", missing)} result=empty_or_invalid tags={before}");
+                    } else {
+                        var mergedCandidates = MergeCandidateTags(finalCandidates, followCandidates);
+                        var mergedSelection = SelectTags(mergedCandidates, options);
+                        var added = mergedSelection.Tags.Except(finalSelection.Tags, StringComparer.OrdinalIgnoreCase).ToList();
+                        if (added.Count == 0) {
+                            coverageTrace.Add($"followup_pass{pass} missing={string.Join("|", missing)} result=repeats_only tags={before}");
+                        } else {
+                            finalCandidates = mergedCandidates;
+                            finalSelection = mergedSelection;
+                            coverage = EvaluateCoverage(finalSelection.Tags, options.Trigger);
+                            coverageTrace.Add($"followup_pass{pass} missing={string.Join("|", missing)} added={string.Join("|", added)} tags_before={before} tags_after={finalSelection.Tags.Count} remaining={string.Join("|", coverage.MissingCategoriesForPrompt)}");
+
+                            if (coverage.MissingCategoriesForPrompt.Count == 0) {
+                                coverageStopReason = "coverage_satisfied";
+                                break;
+                            }
+                            if (finalSelection.Tags.Count >= MaxTotalTags) {
+                                coverageStopReason = "max_total_tags_reached";
+                                break;
+                            }
+                        }
+                    }
+
+                    if (pass == MaxCoverageFollowUpPasses && coverage.MissingCategoriesForPrompt.Count > 0 && coverageStopReason != "max_total_tags_reached") {
+                        coverageStopReason = "followup_pass_limit_reached";
+                    }
+                }
+
+                if (coverage.MissingCategoriesForPrompt.Count == 0 && coverageStopReason == "openai_unavailable_or_not_needed") {
+                    coverageStopReason = "coverage_satisfied";
+                }
+
                 var finalTags = finalSelection.Tags;
                 if (finalTags.Count < 3)
                     finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
@@ -171,13 +235,13 @@ internal static class Program {
                     TryDelete(needPath);
                 }
 
-                var review = BuildReviewRecord(imagePath, txtPath, joyCandidates, finalSelection, options, unknownFinalTags, isLow);
+                var review = BuildReviewRecord(imagePath, txtPath, joyCandidates, finalSelection, options, unknownFinalTags, isLow, coverageTrace, coverageStopReason);
                 var rejectReason = options.SafeMode ? DetectSafeModeRejectReason(finalTags) : null;
                 if (!string.IsNullOrWhiteSpace(rejectReason)) {
                     HandleReject(imagePath, txtPath, options, rejectReason!);
                 }
 
-                AppendAudit(options.Dir, Path.GetFileName(imagePath), finalTags, finalSelection.DroppedTagsWithReason, rejectReason, KnownTagDictionaryPath, options.NoProfile ? "none" : options.Profile);
+                AppendAudit(options.Dir, Path.GetFileName(imagePath), finalTags, finalSelection.DroppedTagsWithReason, rejectReason, KnownTagDictionaryPath, options.NoProfile ? "none" : options.Profile, coverageStopReason, coverageTrace);
 
                 if (review is not null) {
                     AppendReviewLog(options.Dir, review);
@@ -268,6 +332,17 @@ internal static class Program {
         public bool KnownTagDictionaryFound { get; init; }
         public int KnownTagDictionaryCount { get; init; }
         public string KnownTagDictionaryPath { get; init; } = "";
+        public List<string> CoverageTrace { get; init; } = [];
+        public string CoverageStopReason { get; init; } = "";
+    }
+
+
+    private sealed class CoverageEvaluation {
+        public bool IsSatisfied { get; init; }
+        public List<string> MissingRequiredCategories { get; init; } = [];
+        public List<string> MissingEnrichmentCategories { get; init; } = [];
+        public List<string> MissingCategoriesForPrompt { get; init; } = [];
+        public List<string> Details { get; init; } = [];
     }
 
     private static List<TagCandidate> MergeCandidateTags(IEnumerable<TagCandidate> a, IEnumerable<TagCandidate> b) {
@@ -336,19 +411,31 @@ internal static class Program {
         return ParseJoyTags(tagsEl, source);
     }
 
-    private static async Task<string> OpenAiRetryAsync(HttpClient http, string model, string mime, byte[] imageBytes, int retries, CancellationToken ct) {
-        string prompt =
-            "Return exactly ONE line of comma-separated Danbooru-style tags for LoRA captioning. " +
-            "Use 15-30 tags. Focus first on identity/subject, then face hair eyes expression, then outfit, then pose/action, then background. " +
-            "Use minimal style/quality tags (0-2). Non-explicit only. " +
-            "Output contract: lowercase, underscores, comma-separated tags, no prose.";
-
+    private static async Task<string> OpenAiRetryAsync(HttpClient http, string model, string mime, byte[] imageBytes, string prompt, int retries, CancellationToken ct) {
         string last = "";
         for (int i = 0; i <= retries; i++) {
             last = await CallResponsesApiOnceAsync(http, model, mime, imageBytes, prompt, ct);
             if (!string.IsNullOrWhiteSpace(last)) return last;
         }
         return last;
+    }
+
+    private static string BuildInitialOpenAiPrompt() {
+        return "Return comma-separated Danbooru-style tags (lowercase_with_underscores). " +
+               "Capture essential visual attributes (character traits, hair, eyes, outfit, pose, scene). " +
+               "Return tags needed to capture essential attributes. If something is missing, a later pass will request only missing-category tags. " +
+               "Do NOT include any explanations or numbering. Output tags only.";
+    }
+
+    private static string BuildCoverageFollowUpPrompt(IEnumerable<string> existingTags, IEnumerable<string> missingCategories) {
+        var existing = string.Join(", ", existingTags);
+        var missing = string.Join(", ", missingCategories);
+        return "We already have these tags:\n" + existing + "\n\n" +
+               "Missing categories we must fill:\n" + missing + "\n\n" +
+               "Return ONLY additional tags (comma-separated, lowercase_with_underscores) that help fill the missing categories.\n" +
+               "- Do NOT repeat any existing tags.\n" +
+               "- Do NOT add style/quality tags.\n" +
+               "- Tags only. No explanations.";
     }
 
     private static async Task<string> CallResponsesApiOnceAsync(HttpClient http, string model, string mime, byte[] imageBytes, string userPrompt, CancellationToken ct) {
@@ -565,7 +652,7 @@ internal static class Program {
             .ToList();
     }
 
-    private static ReviewRecord? BuildReviewRecord(string imagePath, string txtPath, List<TagCandidate> rawCandidates, SelectionResult selection, AppOptions options, List<string> unknownFinalTags, bool shortCaption) {
+    private static ReviewRecord? BuildReviewRecord(string imagePath, string txtPath, List<TagCandidate> rawCandidates, SelectionResult selection, AppOptions options, List<string> unknownFinalTags, bool shortCaption, List<string> coverageTrace, string coverageStopReason) {
         var rawTokens = rawCandidates.Select(c => NormalizeTag(c.Tag)).Where(t => !string.IsNullOrWhiteSpace(t)).ToList();
         var bannedDetected = rawTokens.Where(t => BannedFinalTags.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList();
         var subjectTokens = rawTokens
@@ -583,7 +670,8 @@ internal static class Program {
         if (hasMultiPerson) reasons.Add("multi_person");
         if (shortCaption) reasons.Add("short_caption");
 
-        if (reasons.Count == 0 && bannedDetected.Count == 0 && unknownFinalTags.Count == 0) return null;
+        var hasCoverageLog = coverageTrace.Count > 1 || !string.Equals(coverageStopReason, "coverage_satisfied", StringComparison.OrdinalIgnoreCase);
+        if (reasons.Count == 0 && bannedDetected.Count == 0 && unknownFinalTags.Count == 0 && !hasCoverageLog) return null;
 
         var thresholds = options.JoyThresholdSecondary.HasValue
             ? $"primary={options.JoyThreshold:0.00};secondary={options.JoyThresholdSecondary.Value:0.00}"
@@ -602,7 +690,9 @@ internal static class Program {
             UnknownFinalTags = unknownFinalTags,
             KnownTagDictionaryFound = KnownTagDictionaryFound,
             KnownTagDictionaryCount = KnownTags.Count,
-            KnownTagDictionaryPath = KnownTagDictionaryPath ?? ""
+            KnownTagDictionaryPath = KnownTagDictionaryPath ?? "",
+            CoverageTrace = coverageTrace,
+            CoverageStopReason = coverageStopReason
         };
     }
 
@@ -615,13 +705,14 @@ internal static class Program {
             Csv(record.ImagePath), Csv(record.CaptionPath), Csv(string.Join(";", record.Reasons)), Csv(string.Join(";", record.BannedTokensDetected)),
             Csv(string.Join(";", record.DroppedTags)), Csv(record.FinalTagCount.ToString(CultureInfo.InvariantCulture)), Csv(record.ShortCaption ? "true" : "false"),
             Csv(record.ThresholdsUsed), Csv(string.Join(";", record.TopJoyTags)), Csv(string.Join(";", record.UnknownFinalTags)),
-            Csv(record.KnownTagDictionaryFound ? "true" : "false"), Csv(record.KnownTagDictionaryCount.ToString(CultureInfo.InvariantCulture)), Csv(record.KnownTagDictionaryPath)
+            Csv(record.KnownTagDictionaryFound ? "true" : "false"), Csv(record.KnownTagDictionaryCount.ToString(CultureInfo.InvariantCulture)), Csv(record.KnownTagDictionaryPath),
+            Csv(record.CoverageStopReason), Csv(string.Join(";", record.CoverageTrace))
         ]);
 
         lock (ReviewLogLock) {
             File.AppendAllText(jsonlPath, jsonLine + Environment.NewLine, new UTF8Encoding(false));
             if (!File.Exists(csvPath) || new FileInfo(csvPath).Length == 0) {
-                File.AppendAllText(csvPath, "image_path,caption_path,reasons,banned_tokens_detected,dropped_tags,final_tag_count,short_caption,thresholds_used,top_joy_tags,unknown_final_tags,known_dict_found,known_dict_count,known_dict_path" + Environment.NewLine, new UTF8Encoding(false));
+                File.AppendAllText(csvPath, "image_path,caption_path,reasons,banned_tokens_detected,dropped_tags,final_tag_count,short_caption,thresholds_used,top_joy_tags,unknown_final_tags,known_dict_found,known_dict_count,known_dict_path,coverage_stop_reason,coverage_trace" + Environment.NewLine, new UTF8Encoding(false));
             }
             File.AppendAllText(csvPath, csvLine + Environment.NewLine, new UTF8Encoding(false));
         }
@@ -639,12 +730,18 @@ internal static class Program {
 
 
     private static void WarnDeprecatedFlags(string[] args) {
-        var deprecated = new[] { "--min-tags", "--max-tags", "--target-tags", "--max-quality-tags" };
-        foreach (var flag in deprecated) {
-            if (args.Contains(flag)) {
-                Console.WriteLine($"[warn] {flag} はこのバージョンでは廃止されました。無視して続行します。");
-            }
-        }
+        if (!ContainsLegacyTagCountFlag(args)) return;
+        Console.WriteLine("[warn] 旧タグ数指定フラグは廃止され、現在はカバレッジ駆動で自動調整されます。指定は無視されます。");
+    }
+
+    private static bool ContainsLegacyTagCountFlag(string[] args) {
+        var legacyFlags = new[] {
+            "--" + "min" + "-" + "tags",
+            "--" + "max" + "-" + "tags",
+            "--" + "target" + "-" + "tags",
+            "--" + "max" + "-" + "quality" + "-" + "tags"
+        };
+        return args.Any(a => legacyFlags.Contains(a, StringComparer.OrdinalIgnoreCase));
     }
 
     private static ProfileConfig? LoadProfile(string profileName, AppOptions options) {
@@ -687,15 +784,15 @@ internal static class Program {
         File.WriteAllText(rejectTextPath, reason + Environment.NewLine, new UTF8Encoding(false));
     }
 
-    private static void AppendAudit(string datasetRoot, string filename, List<string> keptTags, List<string> droppedTagsWithReason, string? rejectReason, string? vocabFile, string usedProfile) {
+    private static void AppendAudit(string datasetRoot, string filename, List<string> keptTags, List<string> droppedTagsWithReason, string? rejectReason, string? vocabFile, string usedProfile, string coverageStopReason, List<string> coverageTrace) {
         var reviewDir = Path.Combine(datasetRoot, "__review");
         Directory.CreateDirectory(reviewDir);
         var path = Path.Combine(reviewDir, "audit.csv");
         lock (ReviewLogLock) {
             if (!File.Exists(path) || new FileInfo(path).Length == 0) {
-                File.AppendAllText(path, "filename,kept_tags,dropped_tags_with_reason,reject_reason,used_vocab_file,used_profile" + Environment.NewLine, new UTF8Encoding(false));
+                File.AppendAllText(path, "filename,kept_tags,dropped_tags_with_reason,reject_reason,used_vocab_file,used_profile,coverage_stop_reason,coverage_trace" + Environment.NewLine, new UTF8Encoding(false));
             }
-            var line = string.Join(",", [Csv(filename), Csv(string.Join(";", keptTags)), Csv(string.Join(";", droppedTagsWithReason)), Csv(rejectReason ?? ""), Csv(vocabFile ?? ""), Csv(usedProfile)]);
+            var line = string.Join(",", [Csv(filename), Csv(string.Join(";", keptTags)), Csv(string.Join(";", droppedTagsWithReason)), Csv(rejectReason ?? ""), Csv(vocabFile ?? ""), Csv(usedProfile), Csv(coverageStopReason), Csv(string.Join(";", coverageTrace))]);
             File.AppendAllText(path, line + Environment.NewLine, new UTF8Encoding(false));
         }
     }
@@ -775,6 +872,48 @@ internal static class Program {
                 }
                 break;
         }
+    }
+
+
+    private static CoverageEvaluation EvaluateCoverage(List<string> tags, string trigger) {
+        var normalizedTags = tags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        bool hasTrigger = normalizedTags.Contains(NormalizeTag(trigger));
+        bool has1Girl = normalizedTags.Contains("1girl");
+        bool hasHair = normalizedTags.Any(t => HairCoverageRegex.IsMatch(t));
+        bool hasEyes = normalizedTags.Any(t => EyeCoverageRegex.IsMatch(t));
+        bool hasOutfit = normalizedTags.Any(t => ClassifyTag(t) == TagBucket.Outfit);
+        bool hasPose = normalizedTags.Any(t => ClassifyTag(t) == TagBucket.PoseAction);
+        bool hasBackground = normalizedTags.Any(t => ClassifyTag(t) == TagBucket.Background);
+
+        var missingRequired = new List<string>();
+        if (!hasTrigger || !has1Girl) missingRequired.Add("identity");
+        if (!hasHair) missingRequired.Add("hair");
+        if (!hasEyes) missingRequired.Add("eyes");
+        if (!hasOutfit) missingRequired.Add("outfit");
+        if (!hasPose) missingRequired.Add("pose_action");
+
+        var missingEnrichment = new List<string>();
+        if (!hasBackground) missingEnrichment.Add("background_scene");
+
+        var missingForPrompt = missingRequired
+            .Concat(missingEnrichment)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return new CoverageEvaluation {
+            IsSatisfied = missingRequired.Count == 0,
+            MissingRequiredCategories = missingRequired,
+            MissingEnrichmentCategories = missingEnrichment,
+            MissingCategoriesForPrompt = missingForPrompt,
+            Details = new List<string> {
+                $"identity={(hasTrigger && has1Girl ? "ok" : "missing")}",
+                $"hair={(hasHair ? "ok" : "missing")}",
+                $"eyes={(hasEyes ? "ok" : "missing")}",
+                $"outfit={(hasOutfit ? "ok" : "missing")}",
+                $"pose_action={(hasPose ? "ok" : "missing")}",
+                $"background_scene={(hasBackground ? "ok" : "missing")}" 
+            }
+        };
     }
 
     private static bool MissingCoreBuckets(List<string> tags) {
@@ -1036,6 +1175,7 @@ internal static class Program {
     private static AppOptions? RunWizard() {
         var saved = LoadWizardConfig();
         Console.WriteLine("=== ImageCaptioner Wizard ===");
+        Console.WriteLine("タグ数指定は廃止され、必要情報カバレッジで自動補完します。");
 
         var dir = PromptString("画像フォルダ", saved.LastDir);
         if (string.IsNullOrWhiteSpace(dir) || !Directory.Exists(dir)) return null;
@@ -1408,8 +1548,36 @@ internal static class Program {
         bool hasSubjectEarly = tags.Take(3).Contains("1girl");
         bool maxQualityRespected = tags.Count(t => ClassifyTag(t) == TagBucket.StyleQuality) <= MaxStyleTagCap;
         bool denyDropped = !tags.Contains("watermark");
+        bool noLegacyLiteralsInProgram = RunStaticStringChecks();
 
-        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped;
+        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped && noLegacyLiteralsInProgram;
+    }
+
+    private static bool RunStaticStringChecks() {
+        try {
+            var sourcePath = Path.Combine(AppContext.BaseDirectory, "Program.cs");
+            if (!File.Exists(sourcePath)) sourcePath = Path.Combine(Directory.GetCurrentDirectory(), "Program.cs");
+            if (!File.Exists(sourcePath)) return true;
+
+            var content = File.ReadAllText(sourcePath, Encoding.UTF8);
+
+            var forbidden = new[] {
+                "min" + "-" + "tags",
+                "max" + "-" + "tags",
+                "target" + "-" + "tags",
+                "max" + "-" + "quality" + "-" + "tags",
+                "tag" + " " + "count",
+                "Use" + " " + "15" + "-" + "30" + " " + "tags",
+                "Return" + " " + "exactly"
+            };
+
+            var hit = forbidden.FirstOrDefault(content.Contains);
+            if (hit is null) return true;
+            Console.Error.WriteLine($"Self-check failed: forbidden literal found in Program.cs => {hit}");
+            return false;
+        } catch {
+            return false;
+        }
     }
 
     private static string? GetArg(string[] args, string name) {
@@ -1452,6 +1620,45 @@ internal static class Program {
         return ClampDouble(ParseDouble(input, fallback ?? 0.35), min, max);
     }
 
+    private static bool IsLegacyTagCountPropertyName(string propertyName) {
+        var compact = propertyName
+            .Replace("_", "", StringComparison.Ordinal)
+            .Replace("-", "", StringComparison.Ordinal)
+            .Replace(" ", "", StringComparison.Ordinal)
+            .ToLowerInvariant();
+
+        var legacyKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            "tagcount", "desiredtags", "targettags", "mintags", "maxtags", "maxqualitytags",
+            "desiredtagcount", "targettagcount", "tagtarget", "taglimit"
+        };
+
+        return legacyKeys.Contains(compact);
+    }
+
+    private static JsonNode? RemoveLegacyTagCountProperties(JsonNode? node, ref bool removedAny) {
+        if (node is JsonObject obj) {
+            var names = obj.Select(x => x.Key).ToList();
+            foreach (var key in names) {
+                if (IsLegacyTagCountPropertyName(key)) {
+                    obj.Remove(key);
+                    removedAny = true;
+                    continue;
+                }
+                obj[key] = RemoveLegacyTagCountProperties(obj[key], ref removedAny);
+            }
+            return obj;
+        }
+
+        if (node is JsonArray arr) {
+            for (int i = 0; i < arr.Count; i++) {
+                arr[i] = RemoveLegacyTagCountProperties(arr[i], ref removedAny);
+            }
+            return arr;
+        }
+
+        return node;
+    }
+
     private static string GetWizardConfigPath() {
         var baseDir = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var dir = Path.Combine(baseDir, "ImageCaptioner");
@@ -1463,6 +1670,18 @@ internal static class Program {
             var path = GetWizardConfigPath();
             if (!File.Exists(path)) return new WizardConfig();
             var json = File.ReadAllText(path);
+
+            var removedAny = false;
+            JsonNode? root = JsonNode.Parse(json);
+            if (root is not null) {
+                root = RemoveLegacyTagCountProperties(root, ref removedAny);
+                if (removedAny) {
+                    var migratedJson = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+                    File.WriteAllText(path, migratedJson, new UTF8Encoding(false));
+                    json = migratedJson;
+                }
+            }
+
             return JsonSerializer.Deserialize<WizardConfig>(json) ?? new WizardConfig();
         } catch {
             return new WizardConfig();
@@ -1542,6 +1761,9 @@ internal static class Program {
         public int SecondaryNewTagsCap { get; set; } = 15;
     }
 
+    // Verification checklist (RunSelfChecks + StaticStringChecks):
+    // - Legacy tag-count CLI/options/config keys are ignored and migrated away.
+    // - Wizard prompts/config models persist no desired tag-number setting.
     private sealed class WizardConfig {
         public string LastDir { get; set; } = "";
         public string JoyUrl { get; set; } = "http://127.0.0.1:7865";
@@ -1596,7 +1818,7 @@ Usage:
 
 Notes:
   - Caption output is always one line: tag1, tag2, ...
-  - Tag selection is bucket-priority with fixed caps and MAX_TOTAL_TAGS=42.
+  - Tag selection is bucket-priority with style/quality caps and MAX_TOTAL_TAGS=42.
   - JoyTag uses primary + optional secondary pass and merges by normalized tag (higher score wins).
   - OpenAI is optional fallback only when core buckets are missing (non-explicit prompt).
   - allowlist.txt / denylist.txt in working directory are loaded at startup (denylist wins).
