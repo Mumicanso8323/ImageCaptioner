@@ -62,16 +62,72 @@ internal static class Program {
     };
 
     private static readonly HashSet<string> ActionTags = new(StringComparer.OrdinalIgnoreCase) {
-        "footjob", "penis_between_feet"
+        "footjob", "penis_between_feet", "foot_on_penis", "foot_sole_stimulation", "trampling_penis",
+        "handjob", "penis_in_hand", "hand_wrapping_penis", "squeezing_penis",
+        "sex", "vaginal_penetration", "missionary", "doggystyle", "cowgirl_position",
+        "blowjob", "penis_in_mouth", "fellatio"
     };
 
     private static readonly Dictionary<string, string> ActionTagAliases = new(StringComparer.OrdinalIgnoreCase) {
         ["pedal_stimulation"] = "footjob",
         ["feet_stimulation"] = "footjob",
-        ["foot_stimulation"] = "footjob"
+        ["foot_stimulation"] = "footjob",
+        ["sexual_intercourse"] = "sex",
+        ["paizuri_sex"] = "sex",
+        ["fellatio"] = "blowjob"
     };
 
+    private static readonly ActionRule[] ActionInferenceRules = [
+        new ActionRule(
+            ParentTag: "footjob",
+            RequiredAll: ["feet", "penis"],
+            RequiredAny: [],
+            ForbiddenAny: [],
+            Subtypes: [
+                new ActionSubtypeRule("penis_between_feet", ["between_feet", "between", "sandwiched", "foot_sandwich"], []),
+                new ActionSubtypeRule("foot_on_penis", ["foot_on_penis", "footjob", "foot_press", "foot_pressing"], []),
+                new ActionSubtypeRule("foot_sole_stimulation", ["sole", "foot_sole", "sole_focus", "underside"], []),
+                new ActionSubtypeRule("trampling_penis", ["stepping", "trampling", "step_on", "weight_on_penis"], [])
+            ]
+        ),
+        new ActionRule(
+            ParentTag: "handjob",
+            RequiredAll: ["penis", "hand"],
+            RequiredAny: [],
+            ForbiddenAny: ["vaginal_penetration", "anal_penetration", "vaginal", "anal", "insertion", "penetration"],
+            Subtypes: [
+                new ActionSubtypeRule("penis_in_hand", ["penis_in_hand", "holding_penis", "holding"], []),
+                new ActionSubtypeRule("hand_wrapping_penis", ["grip", "gripping", "hand_wrapping_penis", "wrapped_hand"], []),
+                new ActionSubtypeRule("squeezing_penis", ["squeezing", "stroking", "jerking", "pumping_motion"], [])
+            ]
+        ),
+        new ActionRule(
+            ParentTag: "sex",
+            RequiredAll: ["penis"],
+            RequiredAny: ["vagina", "vaginal", "vaginal_penetration", "insertion", "penetration", "intercourse"],
+            ForbiddenAny: [],
+            Subtypes: [
+                new ActionSubtypeRule("vaginal_penetration", ["vaginal_penetration", "vaginal", "penis_in_vagina", "insertion", "penetration"], []),
+                new ActionSubtypeRule("missionary", ["missionary", "missionary_position", "face_to_face"], []),
+                new ActionSubtypeRule("doggystyle", ["doggystyle", "doggy_style", "from_behind", "rear_entry"], []),
+                new ActionSubtypeRule("cowgirl_position", ["cowgirl", "cowgirl_position", "female_on_top"], [])
+            ]
+        ),
+        new ActionRule(
+            ParentTag: "blowjob",
+            RequiredAll: ["penis"],
+            RequiredAny: ["mouth", "oral", "fellatio", "sucking"],
+            ForbiddenAny: [],
+            Subtypes: [
+                new ActionSubtypeRule("penis_in_mouth", ["penis_in_mouth", "deepthroat", "mouth_penetration"], []),
+                new ActionSubtypeRule("fellatio", ["fellatio", "oral", "oral_sex"], [])
+            ]
+        )
+    ];
+
     private enum TagBucket { Identity, FaceHairEyes, Outfit, PoseAction, Background, StyleQuality, Other }
+    private sealed record ActionRule(string ParentTag, string[] RequiredAll, string[] RequiredAny, string[] ForbiddenAny, ActionSubtypeRule[] Subtypes);
+    private sealed record ActionSubtypeRule(string Tag, string[] MatchAny, string[] MatchAll);
 
     public static async Task<int> Main(string[] args) {
         try {
@@ -648,10 +704,23 @@ internal static class Program {
 
     private static List<string> InferActionTags(List<string> tags) {
         var inferred = tags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        if (HasTag(inferred, "feet") && HasTag(inferred, "penis")) {
-            if (!HasTag(inferred, "footjob")) inferred.Add("footjob");
-            if (!HasTag(inferred, "penis_between_feet")) inferred.Add("penis_between_feet");
+        var inferredSet = inferred.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var rule in ActionInferenceRules) {
+            if (!MatchesActionRule(inferredSet, rule)) continue;
+
+            if (inferredSet.Add(rule.ParentTag)) {
+                inferred.Add(rule.ParentTag);
+            }
+
+            foreach (var subtype in rule.Subtypes) {
+                if (!MatchesSubtypeRule(inferredSet, subtype)) continue;
+                if (inferredSet.Add(subtype.Tag)) {
+                    inferred.Add(subtype.Tag);
+                }
+            }
         }
+
         return inferred;
     }
 
@@ -662,7 +731,19 @@ internal static class Program {
         if (!hasFeetAndPenis) return;
 
         if (!HasTag(tags, "footjob")) tags.Add("footjob");
-        if (!HasTag(tags, "penis_between_feet")) tags.Add("penis_between_feet");
+    }
+
+    private static bool MatchesActionRule(HashSet<string> normalizedTags, ActionRule rule) {
+        if (rule.RequiredAll.Any() && !rule.RequiredAll.All(normalizedTags.Contains)) return false;
+        if (rule.RequiredAny.Any() && !rule.RequiredAny.Any(normalizedTags.Contains)) return false;
+        if (rule.ForbiddenAny.Any(normalizedTags.Contains)) return false;
+        return true;
+    }
+
+    private static bool MatchesSubtypeRule(HashSet<string> normalizedTags, ActionSubtypeRule subtype) {
+        if (subtype.MatchAny.Any() && !subtype.MatchAny.Any(normalizedTags.Contains)) return false;
+        if (subtype.MatchAll.Any() && !subtype.MatchAll.All(normalizedTags.Contains)) return false;
+        return true;
     }
 
     private static TagSource PreferSource(TagSource a, TagSource b, double scoreA, double scoreB) {
@@ -1618,14 +1699,22 @@ internal static class Program {
         bool denyDropped = !tags.Contains("watermark");
 
         var inferred = InferActionTags(new List<string> { "1girl", "feet", "penis" });
-        bool actionInferenceWorks = inferred.Contains("footjob") && inferred.Contains("penis_between_feet");
+        bool actionInferenceParentOnlyWorks = inferred.Contains("footjob") && !inferred.Contains("penis_between_feet");
+        var footSubtype = InferActionTags(new List<string> { "1girl", "feet", "penis", "between_feet" });
+        bool footSubtypeWorks = footSubtype.Contains("penis_between_feet");
+        var handjobInference = InferActionTags(new List<string> { "1girl", "penis", "hand", "grip" });
+        bool handjobWorks = handjobInference.Contains("handjob") && handjobInference.Contains("hand_wrapping_penis");
+        var sexInference = InferActionTags(new List<string> { "1girl", "penis", "vaginal_penetration", "missionary" });
+        bool sexWorks = sexInference.Contains("sex") && sexInference.Contains("missionary");
         bool aliasNormalized = NormalizeTag("pedal stimulation") == "footjob";
         var sectioned = FormatCaptionWithSections(inferred);
         bool sectionOutputWorks = sectioned.Contains("# Actions", StringComparison.Ordinal) && sectioned.Contains("footjob", StringComparison.Ordinal);
 
         bool noLegacyLiteralsInProgram = RunStaticStringChecks();
 
-        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped && actionInferenceWorks && aliasNormalized && sectionOutputWorks && noLegacyLiteralsInProgram;
+        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped
+            && actionInferenceParentOnlyWorks && footSubtypeWorks && handjobWorks && sexWorks
+            && aliasNormalized && sectionOutputWorks && noLegacyLiteralsInProgram;
     }
 
     private static bool RunStaticStringChecks() {
