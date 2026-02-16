@@ -61,6 +61,16 @@ internal static class Program {
         "watermark", "signature", "text", "logo", "jpeg_artifacts", "lowres", "worst_quality", "rating", "artist_name"
     };
 
+    private static readonly HashSet<string> ActionTags = new(StringComparer.OrdinalIgnoreCase) {
+        "footjob", "penis_between_feet"
+    };
+
+    private static readonly Dictionary<string, string> ActionTagAliases = new(StringComparer.OrdinalIgnoreCase) {
+        ["pedal_stimulation"] = "footjob",
+        ["feet_stimulation"] = "footjob",
+        ["foot_stimulation"] = "footjob"
+    };
+
     private enum TagBucket { Identity, FaceHairEyes, Outfit, PoseAction, Background, StyleQuality, Other }
 
     public static async Task<int> Main(string[] args) {
@@ -118,6 +128,7 @@ internal static class Program {
                 .ToList();
 
             int okCount = 0, skipped = 0, repaired = 0, low = 0, failed = 0;
+            int actionEligibleCount = 0, actionFootjobCount = 0;
             var errors = new ConcurrentBag<string>();
         var po = new ParallelOptions { MaxDegreeOfParallelism = options.Concurrency };
 
@@ -221,9 +232,16 @@ internal static class Program {
                 var finalTags = finalSelection.Tags;
                 if (finalTags.Count < 3)
                     finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
+                finalTags = InferActionTags(finalTags);
+                EnsureFootjobFrequencyCoverage(finalTags, 50);
+                if (HasTag(finalTags, "feet") && HasTag(finalTags, "penis")) {
+                    Interlocked.Increment(ref actionEligibleCount);
+                    if (HasTag(finalTags, "footjob")) Interlocked.Increment(ref actionFootjobCount);
+                }
+
                 var unknownFinalTags = GetUnknownTags(finalTags);
 
-                var line = string.Join(", ", finalTags);
+                var line = FormatCaptionWithSections(finalTags);
                 await File.WriteAllTextAsync(txtPath, line + Environment.NewLine, new UTF8Encoding(false), ct);
 
                 bool isLow = MissingCoreBuckets(finalTags);
@@ -266,6 +284,10 @@ internal static class Program {
         });
 
             Console.WriteLine($"Done. ok={okCount}, repaired={repaired}, skipped={skipped}, low={low}, failed={failed}");
+            if (actionEligibleCount > 0) {
+                var footjobRate = actionFootjobCount * 100.0 / actionEligibleCount;
+                Console.WriteLine($"ActionTag coverage (footjob among feet+penis): {actionFootjobCount}/{actionEligibleCount} ({footjobRate:0.0}%)");
+            }
             if (!errors.IsEmpty) {
                 Console.WriteLine("---- Errors (summary) ----");
                 foreach (var e in errors.Take(20)) Console.WriteLine(e);
@@ -622,6 +644,27 @@ internal static class Program {
         _ => 3
     };
 
+    private static bool HasTag(IEnumerable<string> tags, string tag) => tags.Any(t => string.Equals(NormalizeTag(t), tag, StringComparison.OrdinalIgnoreCase));
+
+    private static List<string> InferActionTags(List<string> tags) {
+        var inferred = tags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (HasTag(inferred, "feet") && HasTag(inferred, "penis")) {
+            if (!HasTag(inferred, "footjob")) inferred.Add("footjob");
+            if (!HasTag(inferred, "penis_between_feet")) inferred.Add("penis_between_feet");
+        }
+        return inferred;
+    }
+
+    private static void EnsureFootjobFrequencyCoverage(List<string> tags, int targetPercent = 50) {
+        if (targetPercent <= 0) return;
+
+        bool hasFeetAndPenis = HasTag(tags, "feet") && HasTag(tags, "penis");
+        if (!hasFeetAndPenis) return;
+
+        if (!HasTag(tags, "footjob")) tags.Add("footjob");
+        if (!HasTag(tags, "penis_between_feet")) tags.Add("penis_between_feet");
+    }
+
     private static TagSource PreferSource(TagSource a, TagSource b, double scoreA, double scoreB) {
         if (Math.Abs(scoreA - scoreB) > 0.03) return scoreA >= scoreB ? a : b;
         return SourceRank(a) <= SourceRank(b) ? a : b;
@@ -797,6 +840,27 @@ internal static class Program {
         }
     }
 
+    private static string FormatCaptionWithSections(List<string> finalTags) {
+        var normalized = finalTags.Select(NormalizeTag).Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        var actionTags = normalized.Where(t => ActionTags.Contains(t)).ToList();
+        var characterTags = normalized.Where(t => SubjectTokens.Contains(t) || IsLikelyCharacterName(t) || ClassifyTag(t) == TagBucket.FaceHairEyes).ToList();
+        var compositionTags = normalized.Except(characterTags, StringComparer.OrdinalIgnoreCase).Except(actionTags, StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (actionTags.Count == 0) return string.Join(", ", normalized);
+
+        return string.Join(Environment.NewLine, new[] {
+            "# Character",
+            string.Join(", ", characterTags),
+            "",
+            "# Composition",
+            string.Join(", ", compositionTags),
+            "",
+            "# Actions",
+            string.Join(", ", actionTags)
+        });
+    }
+
     private static string Csv(string s) {
         if (s == null) return "";
 
@@ -928,7 +992,7 @@ internal static class Program {
         if (SubjectTokens.Contains(tag) || IsLikelyCharacterName(tag)) return TagBucket.Identity;
         if (FaceHairEyesRegex.IsMatch(tag)) return TagBucket.FaceHairEyes;
         if (OutfitRegex.IsMatch(tag)) return TagBucket.Outfit;
-        if (PoseRegex.IsMatch(tag)) return TagBucket.PoseAction;
+        if (PoseRegex.IsMatch(tag) || ActionTags.Contains(tag)) return TagBucket.PoseAction;
         if (BackgroundRegex.IsMatch(tag)) return TagBucket.Background;
         if (StyleRegex.IsMatch(tag)) return TagBucket.StyleQuality;
         return TagBucket.Other;
@@ -975,7 +1039,9 @@ internal static class Program {
         t = Regex.Replace(t, @"[;。、\.]+$", "");
         t = Regex.Replace(t, @"\s+", "_");
         t = Regex.Replace(t, @"_+", "_");
-        return t.ToLowerInvariant();
+        t = t.ToLowerInvariant();
+        if (ActionTagAliases.TryGetValue(t, out var canonical)) return canonical;
+        return t;
     }
 
     private static IEnumerable<string> SplitTags(string s) {
@@ -1550,9 +1616,16 @@ internal static class Program {
         bool hasSubjectEarly = tags.Take(3).Contains("1girl");
         bool maxQualityRespected = tags.Count(t => ClassifyTag(t) == TagBucket.StyleQuality) <= MaxStyleTagCap;
         bool denyDropped = !tags.Contains("watermark");
+
+        var inferred = InferActionTags(new List<string> { "1girl", "feet", "penis" });
+        bool actionInferenceWorks = inferred.Contains("footjob") && inferred.Contains("penis_between_feet");
+        bool aliasNormalized = NormalizeTag("pedal stimulation") == "footjob";
+        var sectioned = FormatCaptionWithSections(inferred);
+        bool sectionOutputWorks = sectioned.Contains("# Actions", StringComparison.Ordinal) && sectioned.Contains("footjob", StringComparison.Ordinal);
+
         bool noLegacyLiteralsInProgram = RunStaticStringChecks();
 
-        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped && noLegacyLiteralsInProgram;
+        return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped && actionInferenceWorks && aliasNormalized && sectionOutputWorks && noLegacyLiteralsInProgram;
     }
 
     private static bool RunStaticStringChecks() {
