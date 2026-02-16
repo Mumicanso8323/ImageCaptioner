@@ -239,6 +239,9 @@ internal static class Program {
 
     private enum TagSource { PrimaryJoy, SecondaryJoy, OpenAI }
 
+    private const int DefaultStyleTagCap = 2;
+    private const int MaxStyleTagCap = 4;
+
     private sealed class SelectionResult {
         public List<string> Tags { get; init; } = [];
         public List<string> DroppedMaleSubjectTags { get; init; } = [];
@@ -421,13 +424,14 @@ internal static class Program {
     }
 
     private static SelectionResult SelectTags(List<TagCandidate> candidates, AppOptions options) {
+        var styleQualityCap = DetermineStyleQualityCap(candidates);
         var caps = new Dictionary<TagBucket, int> {
             [TagBucket.Identity] = 3,
             [TagBucket.FaceHairEyes] = 10,
             [TagBucket.Outfit] = 8,
             [TagBucket.PoseAction] = 6,
             [TagBucket.Background] = 4,
-            [TagBucket.StyleQuality] = options.MaxQualityTags
+            [TagBucket.StyleQuality] = styleQualityCap
         };
 
         var droppedMale = candidates
@@ -512,6 +516,16 @@ internal static class Program {
             result.Add(n);
             return true;
         }
+    }
+
+    private static int DetermineStyleQualityCap(List<TagCandidate> candidates) {
+        var strongStyleCandidates = candidates
+            .Where(c => ClassifyTag(c.Tag) == TagBucket.StyleQuality && c.Score >= 0.60)
+            .Select(c => c.Tag)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+
+        return Clamp(strongStyleCandidates, DefaultStyleTagCap, MaxStyleTagCap);
     }
 
     private static int SourceRank(TagSource source) => source switch {
@@ -625,7 +639,7 @@ internal static class Program {
 
 
     private static void WarnDeprecatedFlags(string[] args) {
-        var deprecated = new[] { "--min-tags", "--max-tags", "--target-tags" };
+        var deprecated = new[] { "--min-tags", "--max-tags", "--target-tags", "--max-quality-tags" };
         foreach (var flag in deprecated) {
             if (args.Contains(flag)) {
                 Console.WriteLine($"[warn] {flag} はこのバージョンでは廃止されました。無視して続行します。");
@@ -956,7 +970,6 @@ internal static class Program {
             JoyUrl = GetArg(args, "--joy-url") ?? "http://127.0.0.1:7865",
             JoyThreshold = ClampDouble(ParseDouble(GetArg(args, "--joy-threshold"), 0.45), 0.10, 0.95),
             JoyThresholdSecondary = ParseOptionalDouble(GetArg(args, "--joy-threshold-secondary"), 0.35),
-            MaxQualityTags = Clamp(ParseInt(GetArg(args, "--max-quality-tags"), 2), 0, 10),
             OpenAiModel = GetArg(args, "--model") ?? "gpt-4.1-mini",
             OpenAiRetries = Clamp(ParseInt(GetArg(args, "--openai-retries"), 1), 0, 6),
             ReprocessBadExisting = !args.Contains("--no-reprocess-bad-existing"),
@@ -998,7 +1011,6 @@ internal static class Program {
             JoyUrl = saved.JoyUrl,
             JoyThreshold = saved.JoyThreshold,
             JoyThresholdSecondary = saved.JoyThresholdSecondary,
-            MaxQualityTags = saved.MaxQualityTags,
             OpenAiModel = saved.OpenAiModel,
             OpenAiRetries = saved.OpenAiRetries,
             DisableOpenAi = saved.DisableOpenAi,
@@ -1040,7 +1052,6 @@ internal static class Program {
             JoyUrl = PromptString("JoyTag URL", saved.JoyUrl),
             JoyThreshold = PromptDouble("JoyTag threshold", saved.JoyThreshold, 0.10, 0.95),
             JoyThresholdSecondary = PromptOptionalDouble("JoyTag secondary threshold(空で無効)", saved.JoyThresholdSecondary, 0.10, 0.95),
-            MaxQualityTags = PromptInt("quality/styleタグ上限", saved.MaxQualityTags, 0, 10),
             OpenAiModel = saved.OpenAiModel,
             OpenAiRetries = saved.OpenAiRetries,
             DisableOpenAi = PromptBoolByEmpty("OpenAI無効化？", saved.DisableOpenAi),
@@ -1385,7 +1396,6 @@ internal static class Program {
 
     private static bool RunSelfChecks() {
         var options = new AppOptions {
-            MaxQualityTags = 2,
             Trigger = "trigger_token",
             MinimalSubjectTags = "1girl"
         };
@@ -1396,7 +1406,7 @@ internal static class Program {
 
         bool prefixFirst = tags.Count > 0 && tags[0] == "trigger_token";
         bool hasSubjectEarly = tags.Take(3).Contains("1girl");
-        bool maxQualityRespected = tags.Count(t => ClassifyTag(t) == TagBucket.StyleQuality) <= 2;
+        bool maxQualityRespected = tags.Count(t => ClassifyTag(t) == TagBucket.StyleQuality) <= MaxStyleTagCap;
         bool denyDropped = !tags.Contains("watermark");
 
         return prefixFirst && hasSubjectEarly && maxQualityRespected && denyDropped;
@@ -1487,7 +1497,6 @@ internal static class Program {
             JoyThresholdSecondary = options.JoyThresholdSecondary,
             OpenAiModel = options.OpenAiModel,
             OpenAiRetries = options.OpenAiRetries,
-            MaxQualityTags = options.MaxQualityTags,
             DisableOpenAi = options.DisableOpenAi,
             ReviewCopyDir = options.ReviewCopyDir ?? "",
             StrictKnownTags = options.StrictKnownTags,
@@ -1510,7 +1519,6 @@ internal static class Program {
         public string JoyUrl { get; set; } = "http://127.0.0.1:7865";
         public double JoyThreshold { get; set; } = 0.45;
         public double? JoyThresholdSecondary { get; set; } = 0.35;
-        public int MaxQualityTags { get; set; } = 2;
         public string OpenAiModel { get; set; } = "gpt-4.1-mini";
         public int OpenAiRetries { get; set; } = 1;
         public string? ApiKey { get; set; }
@@ -1554,7 +1562,6 @@ internal static class Program {
         public double? JoyThresholdSecondary { get; set; } = 0.35;
         public string OpenAiModel { get; set; } = "gpt-4.1-mini";
         public int OpenAiRetries { get; set; } = 1;
-        public int MaxQualityTags { get; set; } = 2;
         public bool DisableOpenAi { get; set; }
         public string ReviewCopyDir { get; set; } = "";
         public bool StrictKnownTags { get; set; }
@@ -1575,7 +1582,6 @@ Usage:
     [--concurrency N] [--target-bytes BYTES]
         [--joy-url http://127.0.0.1:7865]
     [--joy-threshold 0.45] [--joy-threshold-secondary 0.35|off]
-    [--max-quality-tags N]
     [--disable-openai|--no-openai] [--model MODEL] [--openai-retries N]
     [--keep-needtag] [--no-reprocess-bad-existing]
     [--auto-prefix-tags <comma,separated,tags>]
