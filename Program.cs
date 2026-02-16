@@ -692,28 +692,22 @@ internal static class Program {
             }
         }
 
-        var joyTagEntryScript = ResolveJoyTagEntryScript(options.JoyTagWorkingDir);
-        if (joyTagEntryScript is null) {
-            Console.Error.WriteLine("[error] JoyTag entry script not found in --joytag-dir.");
-            Console.Error.WriteLine("        expected one of: joytag_server.py, app.py, joytag_cli.py");
-            Console.Error.WriteLine($"        dir: {options.JoyTagWorkingDir}");
+        if (!TryGetLocalPort(options.JoyUrl, out var joyPort)) {
+            Console.Error.WriteLine($"[error] Failed to parse loopback port from JoyUrl: {options.JoyUrl}");
             return (2, null);
         }
 
-        Console.WriteLine($"[info] Starting JoyTag with {joyTagEntryScript}");
+        Console.WriteLine($"[info] Starting JoyTag with uvicorn on port {joyPort}");
 
         var psi = new ProcessStartInfo {
             FileName = options.JoyTagPythonExe,
             WorkingDirectory = options.JoyTagWorkingDir,
-            Arguments = joyTagEntryScript,
+            Arguments = $"-m uvicorn joytag_server:app --host 127.0.0.1 --port {joyPort} --workers 1",
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
-        if (TryGetLocalPort(options.JoyUrl, out var joyPort)) {
-            psi.Environment["GRADIO_SERVER_PORT"] = joyPort.ToString(CultureInfo.InvariantCulture);
-        }
 
         var process = Process.Start(psi);
         if (process is null) return (2, null);
@@ -795,16 +789,6 @@ internal static class Program {
         }
         PrintRecentJoyTagLogs(stdoutLog, stderrLog);
         return (2, null);
-    }
-
-    private static string? ResolveJoyTagEntryScript(string joyTagWorkingDir) {
-        var candidates = new[] { "joytag_server.py", "app.py", "joytag_cli.py" };
-        foreach (var candidate in candidates) {
-            var candidatePath = Path.Combine(joyTagWorkingDir, candidate);
-            if (File.Exists(candidatePath)) return candidate;
-        }
-
-        return null;
     }
 
     private static void EnqueueLog(ConcurrentQueue<string> queue, string line) {
@@ -926,10 +910,27 @@ internal static class Program {
 
     private static async Task<JoyTagHealthResult> CheckJoyTagHealthAsync(string baseUrl, CancellationToken ct) {
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
-        var endpoints = new[] { "/", "/docs", "/openapi.json" };
 
         var hadTimeout = false;
         Exception? lastException = null;
+
+        try {
+            using var healthResp = await http.GetAsync(baseUrl.TrimEnd('/') + "/health", ct);
+            if (healthResp.IsSuccessStatusCode) {
+                var healthJson = await healthResp.Content.ReadAsStringAsync(ct);
+                using var healthDoc = JsonDocument.Parse(healthJson);
+                if (healthDoc.RootElement.TryGetProperty("ok", out var okEl) && okEl.ValueKind == JsonValueKind.True) {
+                    return new JoyTagHealthResult { IsAlive = true };
+                }
+            }
+        } catch (OperationCanceledException ex) when (!ct.IsCancellationRequested) {
+            hadTimeout = true;
+            lastException = ex;
+        } catch (Exception ex) {
+            lastException = ex;
+        }
+
+        var endpoints = new[] { "/", "/docs", "/openapi.json" };
         foreach (var endpoint in endpoints) {
             try {
                 using var resp = await http.GetAsync(baseUrl.TrimEnd('/') + endpoint, ct);
