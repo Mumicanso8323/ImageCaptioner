@@ -726,12 +726,25 @@ internal static class Program {
         process.BeginErrorReadLine();
 
         for (int i = 0; i < 180; i++) {
+            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) return (0, process);
+
             if (process.HasExited) {
+                if (process.ExitCode == 0) {
+                    Console.WriteLine("[info] JoyTag launcher process exited with code 0. Waiting briefly for detached server startup...");
+                    for (int detachedWait = 0; detachedWait < 20; detachedWait++) {
+                        if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) {
+                            Console.WriteLine("[info] JoyTag became reachable after launcher exit. Continuing with existing server.");
+                            return (0, null);
+                        }
+                        await Task.Delay(500);
+                    }
+                }
+
                 Console.Error.WriteLine($"[error] JoyTag process exited before ready. exit={process.ExitCode}");
                 PrintRecentJoyTagLogs(stdoutLog, stderrLog);
                 return (2, null);
             }
-            if (await IsJoyTagAliveAsync(options.JoyUrl, CancellationToken.None)) return (0, process);
+
             await Task.Delay(1000);
         }
 
