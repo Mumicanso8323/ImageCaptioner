@@ -1,0 +1,23 @@
+{
+  "trigger": "sgrui",
+  "always_add": [
+    "blonde_hair",
+    "bob_cut",
+    "blunt_bangs",
+    "green_eyes",
+    "tareme",
+    "beret",
+    "red_headwear",
+    "blue_ribbon",
+    "pom_pom_(clothes)",
+    "sailor_collar",
+    "grey_dress",
+    "pinstripe_pattern"
+  ],
+  "prefer_keep": [
+    "beret",
+    "bob_cut",
+    "green_eyes",
+    "blonde_hair"
+  ]
+}
