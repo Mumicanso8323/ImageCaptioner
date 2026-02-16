@@ -19,17 +19,21 @@ internal static class Program {
     private static string[] HardPrefixTags = [];
     private static HashSet<string> AllowlistTags = new(StringComparer.OrdinalIgnoreCase);
     private static HashSet<string> DenylistTags = new(StringComparer.OrdinalIgnoreCase);
+    private static HashSet<string> KnownTags = new(StringComparer.OrdinalIgnoreCase);
+    private static bool KnownTagDictionaryFound;
+    private static string? KnownTagDictionaryPath;
 
     private static readonly HashSet<string> SubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
         "1girl", "1boy", "solo", "multiple_girls", "multiple_boys", "2girls", "2boys", "girl", "boy"
     };
     private static readonly HashSet<string> MaleSubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
-        "boy", "1boy", "2boys", "3boys", "4boys", "multiple_boys"
+        "boy", "1boy", "2boys", "3boys", "4boys", "multiple_boys", "male_focus", "yaoi"
     };
-    private static readonly HashSet<string> BlockedFinalSubjectTokens = new(StringComparer.OrdinalIgnoreCase) {
-        "boy", "1boy", "2boys", "3boys", "4boys", "multiple_boys"
+    private static readonly HashSet<string> BannedFinalTags = new(StringComparer.OrdinalIgnoreCase) {
+        "1boy", "boy", "multiple_boys", "2boys", "3boys", "4boys", "male_focus", "yaoi", "male"
     };
     private static readonly object ReviewLogLock = new();
+    private static bool ActiveStrictKnownTags;
 
     private static readonly Regex CharacterNameRegex = new(@"^[a-z0-9]+(_[a-z0-9]+){1,3}$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex FaceHairEyesRegex = new(@"(hair|eyes|eyebrows|eyelashes|pupil|bangs|twintails|ponytail|braid|ahoge|blush|smile|frown|angry|surprised|open_mouth|closed_mouth|tears|looking_)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -65,9 +69,11 @@ internal static class Program {
             var launchWizard = args.Length == 0 || args.Contains("--wizard");
             var options = launchWizard ? RunWizard() : ParseOptions(args, useLast);
             if (options is null) return ExitWithErrorPause(2);
+            ActiveStrictKnownTags = options.StrictKnownTags;
 
         HardPrefixTags = SplitTags(options.AutoPrefixTags).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         LoadAllowDenyLists();
+        LoadKnownTagDictionary();
 
         var minimalFallback = string.Join(", ", HardPrefixTags.Concat(SplitTags(options.MinimalSubjectTags)).Distinct(StringComparer.OrdinalIgnoreCase));
 
@@ -76,6 +82,7 @@ internal static class Program {
             Console.WriteLine($"Concurrency={options.Concurrency} TargetBytes={options.TargetBytes} TargetTags={options.TargetTags} MinTags={options.MinTags} MaxTags={options.MaxTags}");
             Console.WriteLine($"JoyUrl={options.JoyUrl} Threshold={options.JoyThreshold:0.00} Secondary={(options.JoyThresholdSecondary.HasValue ? options.JoyThresholdSecondary.Value.ToString("0.00", CultureInfo.InvariantCulture) : "OFF")}");
             Console.WriteLine($"OpenAI={(string.IsNullOrWhiteSpace(options.ApiKey) ? "OFF" : "ON")} Model={options.OpenAiModel} DisableOpenAI={options.DisableOpenAi}");
+            Console.WriteLine($"KnownTagDictionary={(KnownTagDictionaryFound ? $"FOUND ({KnownTags.Count}) at {KnownTagDictionaryPath}" : "NOT FOUND")}");
         }
 
             Process? autoStartedJoyTagProcess = null;
@@ -119,15 +126,16 @@ internal static class Program {
                 var joyPrimary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThreshold, TagSource.PrimaryJoy, ct);
                 var joyCandidates = joyPrimary.Tags;
 
+                // Keep thresholds deterministic and do not chase MinTags by repeatedly lowering threshold.
                 if (options.JoyThresholdSecondary.HasValue) {
                     var joySecondary = await CallJoyTagAsync(httpJoy, options.JoyUrl, bytes, options.JoyThresholdSecondary.Value, TagSource.SecondaryJoy, ct);
-                    joyCandidates = MergeCandidateTags(joyCandidates, joySecondary.Tags);
+                    joyCandidates = MergeCandidateTags(joyCandidates, LimitSecondaryTags(joyPrimary.Tags, joySecondary.Tags, options.SecondaryNewTagsCap));
                 }
 
                 var selectedFromJoy = SelectTags(joyCandidates, options);
                 bool needOpenAi = !options.DisableOpenAi
                     && !string.IsNullOrWhiteSpace(options.ApiKey)
-                    && (selectedFromJoy.Tags.Count < options.MinTags || MissingCoreBuckets(selectedFromJoy.Tags));
+                    && MissingCoreBuckets(selectedFromJoy.Tags);
 
                 var finalCandidates = joyCandidates;
                 if (needOpenAi) {
@@ -140,6 +148,7 @@ internal static class Program {
                 var finalTags = finalSelection.Tags;
                 if (finalTags.Count < 3)
                     finalTags = SelectTags(ParseTagCandidatesFromLine(minimalFallback, null, 1.0, TagSource.OpenAI), options).Tags;
+                var unknownFinalTags = GetUnknownTags(finalTags);
 
                 var line = string.Join(", ", finalTags);
                 await File.WriteAllTextAsync(txtPath, line + Environment.NewLine, new UTF8Encoding(false), ct);
@@ -153,7 +162,7 @@ internal static class Program {
                     TryDelete(needPath);
                 }
 
-                var review = BuildReviewRecord(imagePath, txtPath, joyCandidates, finalSelection, options);
+                var review = BuildReviewRecord(imagePath, txtPath, joyCandidates, finalSelection, options, unknownFinalTags, finalTags.Count < options.MinTags);
                 if (review is not null) {
                     AppendReviewLog(options.Dir, review);
                     if (!string.IsNullOrWhiteSpace(options.ReviewCopyDir)) {
@@ -223,12 +232,16 @@ internal static class Program {
         public string ImagePath { get; init; } = "";
         public string CaptionPath { get; init; } = "";
         public List<string> Reasons { get; init; } = [];
-        public List<string> DetectedSubjectTokens { get; init; } = [];
+        public List<string> BannedTokensDetected { get; init; } = [];
         public List<string> DroppedTags { get; init; } = [];
         public int FinalTagCount { get; init; }
-        public double PrimaryThreshold { get; init; }
-        public double? SecondaryThreshold { get; init; }
+        public bool ShortCaption { get; init; }
+        public string ThresholdsUsed { get; init; } = "";
         public List<string> TopJoyTags { get; init; } = [];
+        public List<string> UnknownFinalTags { get; init; } = [];
+        public bool KnownTagDictionaryFound { get; init; }
+        public int KnownTagDictionaryCount { get; init; }
+        public string KnownTagDictionaryPath { get; init; } = "";
     }
 
     private static List<TagCandidate> MergeCandidateTags(IEnumerable<TagCandidate> a, IEnumerable<TagCandidate> b) {
@@ -396,7 +409,7 @@ internal static class Program {
 
         var droppedMale = candidates
             .Select(c => NormalizeTag(c.Tag))
-            .Where(t => !string.IsNullOrWhiteSpace(t) && BlockedFinalSubjectTokens.Contains(t))
+            .Where(t => !string.IsNullOrWhiteSpace(t) && BannedFinalTags.Contains(t))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -486,10 +499,9 @@ internal static class Program {
     private static double ComputeDynamicCutoff(List<TagCandidate> sorted, AppOptions options) {
         if (sorted.Count == 0) return double.MaxValue;
         var topScore = sorted[0].Score;
-        var p70Idx = (int)Math.Floor((sorted.Count - 1) * 0.70);
-        var p70 = sorted[p70Idx].Score;
-        var secondaryFloor = options.JoyThresholdSecondary ?? options.JoyThreshold;
-        return Math.Max(secondaryFloor, Math.Max(topScore * 0.55, p70));
+        var median = sorted[sorted.Count / 2].Score;
+        var fallback = options.JoyThresholdSecondary ?? options.JoyThreshold;
+        return Math.Max(fallback, Math.Max(0.05, Math.Max(topScore - 0.35, median * 0.65)));
     }
 
     private static int SourceRank(TagSource source) => source switch {
@@ -504,39 +516,69 @@ internal static class Program {
         return SourceRank(a) <= SourceRank(b) ? a : b;
     }
 
-    private static ReviewRecord? BuildReviewRecord(string imagePath, string txtPath, List<TagCandidate> rawCandidates, SelectionResult selection, AppOptions options) {
-        var subjectTokens = rawCandidates
-            .Select(c => NormalizeTag(c.Tag))
+    private static List<TagCandidate> LimitSecondaryTags(List<TagCandidate> primary, List<TagCandidate> secondary, int cap) {
+        if (cap <= 0 || secondary.Count == 0) return [];
+        var primarySet = primary.Select(x => x.Tag).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var accepted = new List<TagCandidate>();
+        foreach (var c in secondary.OrderByDescending(x => x.Score).ThenBy(x => x.Order)) {
+            if (primarySet.Contains(c.Tag)) {
+                accepted.Add(c);
+                continue;
+            }
+            if (cap == 0) continue;
+            accepted.Add(c);
+            cap--;
+        }
+        return accepted;
+    }
+
+    private static List<string> GetUnknownTags(IEnumerable<string> tags) {
+        if (!KnownTagDictionaryFound || KnownTags.Count == 0) return [];
+        return tags.Select(NormalizeTag)
+            .Where(t => !string.IsNullOrWhiteSpace(t) && !KnownTags.Contains(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(t => t, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static ReviewRecord? BuildReviewRecord(string imagePath, string txtPath, List<TagCandidate> rawCandidates, SelectionResult selection, AppOptions options, List<string> unknownFinalTags, bool shortCaption) {
+        var rawTokens = rawCandidates.Select(c => NormalizeTag(c.Tag)).Where(t => !string.IsNullOrWhiteSpace(t)).ToList();
+        var bannedDetected = rawTokens.Where(t => BannedFinalTags.Contains(t)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(t => t, StringComparer.OrdinalIgnoreCase).ToList();
+        var subjectTokens = rawTokens
             .Where(t => SubjectTokens.Contains(t) || t.Contains("boys", StringComparison.OrdinalIgnoreCase) || t.Contains("girls", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
         var reasons = new List<string>();
-        bool hasMale = subjectTokens.Any(t => MaleSubjectTokens.Contains(t));
-        bool hasMulti = subjectTokens.Any(t => t.StartsWith("multiple_", StringComparison.OrdinalIgnoreCase) || Regex.IsMatch(t, @"^\d+(girl|girls|boy|boys)$", RegexOptions.IgnoreCase));
+        bool hasMale = bannedDetected.Count > 0 || subjectTokens.Any(t => MaleSubjectTokens.Contains(t));
         bool hasGirl = subjectTokens.Any(t => t.Contains("girl", StringComparison.OrdinalIgnoreCase));
+        bool hasMultiPerson = subjectTokens.Any(t => t.StartsWith("multiple_", StringComparison.OrdinalIgnoreCase) || Regex.IsMatch(t, @"^\d+(girl|girls|boy|boys)$", RegexOptions.IgnoreCase));
 
         if (hasMale) reasons.Add("male_subject_token");
-        if (hasMulti || (hasMale && hasGirl)) reasons.Add("mixed_subject_tokens");
+        if (hasMale && hasGirl) reasons.Add("mixed_subject_tokens");
+        if (hasMultiPerson) reasons.Add("multi_person");
+        if (shortCaption) reasons.Add("short_caption");
 
-        var hasPortraitContext = rawCandidates.Any(c => {
-            var t = NormalizeTag(c.Tag);
-            return t.Contains("face") || t.Contains("portrait") || t.Contains("close-up") || t.Contains("looking_at_viewer");
-        });
-        if (hasMale && hasPortraitContext) reasons.Add("male_face_context");
+        if (reasons.Count == 0 && bannedDetected.Count == 0 && unknownFinalTags.Count == 0) return null;
 
-        if (reasons.Count == 0) return null;
+        var thresholds = options.JoyThresholdSecondary.HasValue
+            ? $"primary={options.JoyThreshold:0.00};secondary={options.JoyThresholdSecondary.Value:0.00}"
+            : $"primary={options.JoyThreshold:0.00}";
 
         return new ReviewRecord {
             ImagePath = imagePath,
             CaptionPath = txtPath,
             Reasons = reasons.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
-            DetectedSubjectTokens = subjectTokens,
+            BannedTokensDetected = bannedDetected,
             DroppedTags = selection.DroppedMaleSubjectTags,
             FinalTagCount = selection.Tags.Count,
-            PrimaryThreshold = options.JoyThreshold,
-            SecondaryThreshold = options.JoyThresholdSecondary,
-            TopJoyTags = rawCandidates.OrderByDescending(c => c.Score).ThenBy(c => c.Order).Take(10).Select(c => c.Tag).ToList()
+            ShortCaption = shortCaption,
+            ThresholdsUsed = thresholds,
+            TopJoyTags = rawCandidates.OrderByDescending(c => c.Score).ThenBy(c => c.Order).Take(20).Select(c => c.Tag).ToList(),
+            UnknownFinalTags = unknownFinalTags,
+            KnownTagDictionaryFound = KnownTagDictionaryFound,
+            KnownTagDictionaryCount = KnownTags.Count,
+            KnownTagDictionaryPath = KnownTagDictionaryPath ?? ""
         };
     }
 
@@ -546,16 +588,16 @@ internal static class Program {
         var csvPath = Path.Combine(datasetRoot, "review_candidates.csv");
         var jsonLine = JsonSerializer.Serialize(record);
         var csvLine = string.Join(",", [
-            Csv(record.ImagePath), Csv(record.CaptionPath), Csv(string.Join(";", record.Reasons)), Csv(string.Join(";", record.DetectedSubjectTokens)),
-            Csv(string.Join(";", record.DroppedTags)), Csv(record.FinalTagCount.ToString(CultureInfo.InvariantCulture)),
-            Csv(record.PrimaryThreshold.ToString("0.00", CultureInfo.InvariantCulture)), Csv((record.SecondaryThreshold?.ToString("0.00", CultureInfo.InvariantCulture)) ?? ""),
-            Csv(string.Join(";", record.TopJoyTags))
+            Csv(record.ImagePath), Csv(record.CaptionPath), Csv(string.Join(";", record.Reasons)), Csv(string.Join(";", record.BannedTokensDetected)),
+            Csv(string.Join(";", record.DroppedTags)), Csv(record.FinalTagCount.ToString(CultureInfo.InvariantCulture)), Csv(record.ShortCaption ? "true" : "false"),
+            Csv(record.ThresholdsUsed), Csv(string.Join(";", record.TopJoyTags)), Csv(string.Join(";", record.UnknownFinalTags)),
+            Csv(record.KnownTagDictionaryFound ? "true" : "false"), Csv(record.KnownTagDictionaryCount.ToString(CultureInfo.InvariantCulture)), Csv(record.KnownTagDictionaryPath)
         ]);
 
         lock (ReviewLogLock) {
             File.AppendAllText(jsonlPath, jsonLine + Environment.NewLine, new UTF8Encoding(false));
             if (!File.Exists(csvPath) || new FileInfo(csvPath).Length == 0) {
-                File.AppendAllText(csvPath, "image_path,caption_path,reasons,detected_subject_tokens,dropped_tags,final_tag_count,primary_threshold,secondary_threshold,top_joy_tags" + Environment.NewLine, new UTF8Encoding(false));
+                File.AppendAllText(csvPath, "image_path,caption_path,reasons,banned_tokens_detected,dropped_tags,final_tag_count,short_caption,thresholds_used,top_joy_tags,unknown_final_tags,known_dict_found,known_dict_count,known_dict_path" + Environment.NewLine, new UTF8Encoding(false));
             }
             File.AppendAllText(csvPath, csvLine + Environment.NewLine, new UTF8Encoding(false));
         }
@@ -574,6 +616,80 @@ internal static class Program {
     private static string Csv(string s) {
         var escaped = s.Replace(""", """");
         return $""{escaped}"";
+    }
+
+    private static void LoadKnownTagDictionary() {
+        KnownTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        KnownTagDictionaryFound = false;
+        KnownTagDictionaryPath = null;
+
+        var roots = new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() }
+            .Where(d => !string.IsNullOrWhiteSpace(d))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var root in roots) {
+            if (!Directory.Exists(root)) continue;
+            var files = Directory.EnumerateFiles(root)
+                .Where(f => {
+                    var n = Path.GetFileName(f);
+                    return n.Equals("joytag_tags.txt", StringComparison.OrdinalIgnoreCase)
+                        || n.Equals("tags.txt", StringComparison.OrdinalIgnoreCase)
+                        || n.Equals("tags.csv", StringComparison.OrdinalIgnoreCase)
+                        || n.Equals("tags.json", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            foreach (var file in files) {
+                if (TryLoadKnownTagsFromFile(file, out var loaded) && loaded.Count > 0) {
+                    KnownTags = loaded;
+                    KnownTagDictionaryFound = true;
+                    KnownTagDictionaryPath = file;
+                    return;
+                }
+            }
+        }
+    }
+
+    private static bool TryLoadKnownTagsFromFile(string path, out HashSet<string> tags) {
+        tags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try {
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            if (ext == ".json") {
+                using var doc = JsonDocument.Parse(File.ReadAllText(path, Encoding.UTF8));
+                ExtractKnownTagsFromJson(doc.RootElement, tags);
+            } else {
+                foreach (var line in File.ReadLines(path, Encoding.UTF8)) {
+                    var cleaned = line.Trim();
+                    if (string.IsNullOrWhiteSpace(cleaned)) continue;
+                    foreach (var raw in cleaned.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {
+                        var n = NormalizeTag(raw);
+                        if (!string.IsNullOrWhiteSpace(n)) tags.Add(n);
+                    }
+                }
+            }
+            return tags.Count > 0;
+        } catch {
+            return false;
+        }
+    }
+
+    private static void ExtractKnownTagsFromJson(JsonElement element, HashSet<string> tags) {
+        switch (element.ValueKind) {
+            case JsonValueKind.String:
+                var n = NormalizeTag(element.GetString() ?? "");
+                if (!string.IsNullOrWhiteSpace(n)) tags.Add(n);
+                break;
+            case JsonValueKind.Array:
+                foreach (var child in element.EnumerateArray()) ExtractKnownTagsFromJson(child, tags);
+                break;
+            case JsonValueKind.Object:
+                foreach (var prop in element.EnumerateObject()) {
+                    ExtractKnownTagsFromJson(prop.Value, tags);
+                    var pn = NormalizeTag(prop.Name);
+                    if (!string.IsNullOrWhiteSpace(pn)) tags.Add(pn);
+                }
+                break;
+        }
     }
 
     private static bool MissingCoreBuckets(List<string> tags) {
@@ -605,9 +721,10 @@ internal static class Program {
         if (DropTagsContains.Any(lower.Contains)) return true;
         if (lower.StartsWith("rating:")) return true;
         if (BuiltinDenyTags.Contains(lower)) return true;
-        if (BlockedFinalSubjectTokens.Contains(lower)) return true;
+        if (BannedFinalTags.Contains(lower)) return true;
         if (DenylistTags.Contains(lower)) return true;
         if (AllowlistTags.Count > 0 && !AllowlistTags.Contains(lower) && (lower.StartsWith("rating") || lower.Contains("watermark"))) return true;
+        if (KnownTagDictionaryFound && ActiveStrictKnownTags && !KnownTags.Contains(lower)) return true;
         return false;
     }
 
@@ -726,6 +843,7 @@ internal static class Program {
             fromSaved.Quiet = args.Contains("--quiet") ? true : fromSaved.Quiet;
             fromSaved.DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai") || fromSaved.DisableOpenAi;
             fromSaved.ReviewCopyDir = GetArg(args, "--review-copy-dir") ?? fromSaved.ReviewCopyDir;
+            fromSaved.StrictKnownTags = args.Contains("--strict-known-tags") ? true : fromSaved.StrictKnownTags;
 
             var apiKeySaved = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
             if (fromSaved.DisableOpenAi) apiKeySaved = null;
@@ -767,11 +885,11 @@ internal static class Program {
             JoyAutoPort = args.Contains("--joy-auto-port"),
             JoyKillConflictProcess = args.Contains("--joy-kill-conflict"),
             DisableOpenAi = args.Contains("--disable-openai") || args.Contains("--no-openai"),
-            ReviewCopyDir = GetArg(args, "--review-copy-dir")
+            ReviewCopyDir = GetArg(args, "--review-copy-dir"),
+            StrictKnownTags = args.Contains("--strict-known-tags")
         };
 
         if (options.MaxTags < options.MinTags) options.MaxTags = options.MinTags;
-        options.TargetTags = Clamp(options.TargetTags, options.MinTags, options.MaxTags);
 
         var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         if (options.DisableOpenAi) apiKey = null;
@@ -808,7 +926,8 @@ internal static class Program {
             JoyTagPythonExe = saved.JoyTagPythonExe,
             JoyAutoPort = saved.JoyAutoPort,
             JoyKillConflictProcess = saved.JoyKillConflictProcess,
-            ReviewCopyDir = saved.ReviewCopyDir
+            ReviewCopyDir = saved.ReviewCopyDir,
+            StrictKnownTags = saved.StrictKnownTags
         };
     }
 
@@ -845,10 +964,10 @@ internal static class Program {
             JoyTagPythonExe = PromptString("JoyTag python.exe", saved.JoyTagPythonExe),
             JoyAutoPort = PromptBoolByEmpty("ポート競合時に自動で別ポートを使う？", saved.JoyAutoPort),
             JoyKillConflictProcess = PromptBoolByEmpty("ポート競合プロセスを自動終了する？", saved.JoyKillConflictProcess),
-            ReviewCopyDir = PromptString("レビュー用コピー先フォルダ(空で無効)", saved.ReviewCopyDir)
+            ReviewCopyDir = PromptString("レビュー用コピー先フォルダ(空で無効)", saved.ReviewCopyDir),
+            StrictKnownTags = PromptBoolByEmpty("未知タグを除外する？(--strict-known-tags)", saved.StrictKnownTags)
         };
 
-        options.TargetTags = Clamp(options.TargetTags, options.MinTags, options.MaxTags);
 
         var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
         if (options.DisableOpenAi) apiKey = null;
@@ -1283,7 +1402,8 @@ internal static class Program {
             OpenAiRetries = options.OpenAiRetries,
             MaxQualityTags = options.MaxQualityTags,
             DisableOpenAi = options.DisableOpenAi,
-            ReviewCopyDir = options.ReviewCopyDir ?? ""
+            ReviewCopyDir = options.ReviewCopyDir ?? "",
+            StrictKnownTags = options.StrictKnownTags
         };
     }
 
@@ -1315,6 +1435,8 @@ internal static class Program {
         public bool JoyAutoPort { get; set; } = true;
         public bool JoyKillConflictProcess { get; set; }
         public string? ReviewCopyDir { get; set; }
+        public bool StrictKnownTags { get; set; }
+        public int SecondaryNewTagsCap { get; set; } = 15;
     }
 
     private sealed class WizardConfig {
@@ -1343,6 +1465,7 @@ internal static class Program {
         public int MaxQualityTags { get; set; } = 2;
         public bool DisableOpenAi { get; set; }
         public string ReviewCopyDir { get; set; } = "";
+        public bool StrictKnownTags { get; set; }
     }
 
     private static void PrintHelp() {
@@ -1363,16 +1486,17 @@ Usage:
     [--minimal-subject-tags <comma,separated,tags>]
     [--auto-start-joytag --joytag-dir D:\tools\joytag --joytag-python D:\tools\joytag\venv\Scripts\python.exe]
     [--joy-auto-port] [--joy-kill-conflict]
-    [--review-copy-dir <dir>]
+    [--review-copy-dir <dir>] [--strict-known-tags]
     [--use-last] [--dir <path>]
     [--self-check]
 
 Notes:
   - Caption output is always one line: tag1, tag2, ...
-  - Default caption range is short and stable for LoRA (15-35 tags, target 25).
+  - Default caption range is variable and capped by max-tags (no min-tags threshold chasing).
   - JoyTag uses primary + optional secondary pass and merges by normalized tag (higher score wins).
-  - OpenAI is optional fallback only when core buckets are missing or user enables it.
+  - OpenAI is optional fallback only when core buckets are missing (non-explicit prompt).
   - allowlist.txt / denylist.txt in working directory are loaded at startup (denylist wins).
-  - Final captions always force 1girl and remove male-subject tokens (logged for review).");
+  - Final captions always force 1girl and remove banned male-subject tokens (logged for review).
+  - Optional known tag dictionary: joytag_tags.txt / tags.txt / tags.csv / tags.json; --strict-known-tags drops unknown tags.");
     }
 }
